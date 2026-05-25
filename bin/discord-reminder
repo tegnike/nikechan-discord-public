@@ -1,0 +1,531 @@
+#!/Users/nikenike/.hermes/hermes-agent/venv/bin/python
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import secrets
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
+
+STATE_VERSION = 1
+MAX_BODY_CHARS = 800
+MAX_DISCORD_CHARS = 1900
+FORBIDDEN_BODY_RE = re.compile(
+    r"(@everyone|@here|<@&\d+>|凍結|タイムアウト|timeout|\bban\b|\bkick\b|mute|ミュート|削除して|消して|通報)",
+    re.I,
+)
+RELATIVE_RE = re.compile(r"(?:(\d{1,4})\s*(分|時間|日)\s*後|半日後)")
+TIME_RE = re.compile(r"(午前|午後)?\s*(\d{1,2})\s*(?:[:：時]\s*(\d{1,2})?)?\s*分?")
+WEEKDAY = {"月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6}
+
+
+def load_env() -> dict[str, str]:
+    env = dict(os.environ)
+    homes = []
+    if env.get("HERMES_HOME"):
+        homes.append(Path(env["HERMES_HOME"]))
+    homes.append(Path.home() / ".hermes")
+    for home in homes:
+        path = home / ".env"
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            key, value = raw.split("=", 1)
+            env.setdefault(key.strip(), value.strip().strip("\"'"))
+    return env
+
+
+ENV = load_env()
+HOME = Path(ENV.get("HERMES_HOME") or Path.home() / ".hermes")
+STATE_DIR = HOME / "local" / "discord-reminders"
+STATE_FILE = STATE_DIR / "reminders.json"
+LOCK_FILE = STATE_DIR / ".lock"
+
+
+def tzinfo() -> dt.tzinfo:
+    name = ENV.get("TZ") or ENV.get("timezone") or "Asia/Tokyo"
+    if ZoneInfo is None:
+        return dt.timezone.utc
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return dt.timezone.utc
+
+
+def now_local() -> dt.datetime:
+    return dt.datetime.now(tzinfo())
+
+
+def iso(value: dt.datetime) -> str:
+    return value.astimezone(tzinfo()).isoformat()
+
+
+def parse_iso(value: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(tzinfo())
+
+
+def state_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fh = LOCK_FILE.open("a+", encoding="utf-8")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    return fh
+
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {"version": STATE_VERSION, "reminders": []}
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        corrupt = STATE_FILE.with_suffix(f".corrupt-{int(dt.datetime.now().timestamp())}.json")
+        STATE_FILE.rename(corrupt)
+        return {"version": STATE_VERSION, "reminders": []}
+    if not isinstance(data, dict):
+        return {"version": STATE_VERSION, "reminders": []}
+    data.setdefault("version", STATE_VERSION)
+    data.setdefault("reminders", [])
+    return data
+
+
+def save_state(data: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".reminders-", suffix=".json", dir=str(STATE_DIR))
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_FILE)
+
+
+def parse_time_of_day(text: str, default_hour: int = 9, default_minute: int = 0) -> tuple[int, int]:
+    candidates = list(TIME_RE.finditer(text))
+    if not candidates:
+        return default_hour, default_minute
+    for m in candidates:
+        start = max(0, m.start() - 8)
+        end = min(len(text), m.end() + 8)
+        context = text[start:end]
+        if any(key in context for key in ("時", ":", "：", "朝", "昼", "夜", "午前", "午後", "明日", "今日", "毎")):
+            hour = int(m.group(2))
+            minute = int(m.group(3) or 0)
+            if m.group(1) == "午後" and hour < 12:
+                hour += 12
+            if m.group(1) == "午前" and hour == 12:
+                hour = 0
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return hour, minute
+    return default_hour, default_minute
+
+
+def parse_schedule(text: str) -> tuple[str, str, dict | None, str]:
+    local_now = now_local()
+    recurring = re.search(r"毎週\s*([月火水木金土日])(?:曜(?:日)?)?", text)
+    if recurring:
+        hour, minute = parse_time_of_day(text, 9, 0)
+        weekday = WEEKDAY[recurring.group(1)]
+        days_ahead = (weekday - local_now.weekday()) % 7
+        run = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0) + dt.timedelta(days=days_ahead)
+        if run <= local_now:
+            run += dt.timedelta(days=7)
+        recurrence = {"kind": "weekly", "weekday": weekday, "hour": hour, "minute": minute}
+        label = f"毎週{recurring.group(1)}曜 {hour:02d}:{minute:02d}"
+        return iso(run), label, recurrence, "weekly"
+
+    if re.search(r"毎日|毎朝|毎晩|毎夜", text):
+        default_hour = 21 if re.search(r"毎晩|毎夜", text) else 9
+        hour, minute = parse_time_of_day(text, default_hour, 0)
+        run = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if run <= local_now:
+            run += dt.timedelta(days=1)
+        recurrence = {"kind": "daily", "hour": hour, "minute": minute}
+        return iso(run), f"毎日 {hour:02d}:{minute:02d}", recurrence, "daily"
+
+    if re.search(r"(分|時間)\s*(?:ごと|おき|毎|に1回)|毎\s*\d+\s*(?:分|時間)", text):
+        raise ValueError("短い間隔の定期リマインダーは公開Discordでは作成しません。毎日または毎週で指定してください。")
+
+    rel = RELATIVE_RE.search(text)
+    if rel:
+        if "半日後" in rel.group(0):
+            run = local_now + dt.timedelta(hours=12)
+            return iso(run), "12時間後", None, "once"
+        amount = int(rel.group(1))
+        unit = rel.group(2)
+        if unit == "分":
+            if amount < 1 or amount > 60 * 24 * 30:
+                raise ValueError("分指定は1分から30日以内にしてください。")
+            run = local_now + dt.timedelta(minutes=amount)
+        elif unit == "時間":
+            if amount < 1 or amount > 24 * 365:
+                raise ValueError("時間指定は1時間から365日以内にしてください。")
+            run = local_now + dt.timedelta(hours=amount)
+        else:
+            if amount < 1 or amount > 365:
+                raise ValueError("日指定は1日から365日以内にしてください。")
+            run = local_now + dt.timedelta(days=amount)
+        return iso(run), f"{amount}{unit}後", None, "once"
+
+    if "明後日" in text or "明日" in text or "今日" in text:
+        day_offset = 2 if "明後日" in text else 1 if "明日" in text else 0
+        hour, minute = parse_time_of_day(text, 9, 0)
+        run = (local_now + dt.timedelta(days=day_offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if run <= local_now:
+            run += dt.timedelta(days=1)
+        day_label = "明後日" if day_offset == 2 else "明日" if day_offset == 1 else "今日"
+        return iso(run), f"{day_label} {hour:02d}:{minute:02d}", None, "once"
+
+    raise ValueError("時刻を読み取れませんでした。例: 10分後、明日10時、毎日9時、毎週月曜9時。")
+
+
+def target_channel(text: str, current_channel: str) -> tuple[str, str]:
+    mention = re.search(r"<#(\d+)>", text)
+    if mention:
+        channel_id = mention.group(1)
+        return channel_id, f"<#{channel_id}>"
+    if current_channel:
+        return current_channel, f"<#{current_channel}>"
+    raise ValueError("通知先チャンネルを特定できませんでした。")
+
+
+def strip_bot_mentions(text: str) -> str:
+    text = re.sub(r"<@!?\d+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_body(body: str) -> str:
+    body = re.sub(r"\s+", " ", body).strip(" 　。、")
+    if body.startswith("に") or body.startswith("で"):
+        body = body[1:].strip(" 　。、")
+    body = re.sub(r"(?:って|と)$", "", body).strip(" 　。、")
+    if not body or len(body) < 2:
+        raise ValueError("リマインダー本文を読み取れませんでした。")
+    if FORBIDDEN_BODY_RE.search(body):
+        raise ValueError("メンション拡散やモデレーション操作を含むリマインダーは作成しません。")
+    return body[:MAX_BODY_CHARS]
+
+
+def extract_body(text: str) -> str:
+    original = strip_bot_mentions(text)
+    patterns = [
+        r"(?:後|明日|明後日|今日|毎日|毎朝|毎晩|毎夜|毎週[月火水木金土日]曜?(?:日)?)[^、。\n]*?[にで]\s*(.+?)(?:を)?(?:リマインド|通知|教えて|言って|送って|投稿して|知らせて)",
+        r"(?:リマインド|通知|教えて|言って|送って|投稿して|知らせて)\s*[:：]?\s*(.+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, original)
+        if m:
+            body = m.group(1).strip(" 　。、")
+            if body:
+                return normalize_body(body)
+
+    body = original
+    body = re.sub(r"<#\d+>", " ", body)
+    body = re.sub(r"(?:(?:\d{1,4}\s*(?:分|時間|日)\s*後)|半日後)", " ", body)
+    body = re.sub(r"(明後日|明日|今日|毎日|毎朝|毎晩|毎夜|毎週\s*[月火水木金土日]曜?(?:日)?)", " ", body)
+    body = re.sub(r"(午前|午後)?\s*\d{1,2}\s*(?:[:：時]\s*\d{0,2})?\s*分?", " ", body)
+    body = re.sub(r"(リマインダー?|リマインド|通知|教えて|言って|送って|投稿して|知らせて|ください|して|お願い)", " ", body)
+    return normalize_body(body)
+
+
+def next_recurrence(current: dt.datetime, recurrence: dict) -> dt.datetime | None:
+    kind = recurrence.get("kind")
+    if kind == "daily":
+        return current + dt.timedelta(days=1)
+    if kind == "weekly":
+        return current + dt.timedelta(days=7)
+    return None
+
+
+
+def active_reminders(data: dict) -> list[dict]:
+    return [r for r in data.get("reminders", []) if r.get("status") == "scheduled"]
+
+
+def text_minutes(text: str) -> int | None:
+    m = re.search(r"(\d{1,4})\s*分", text)
+    return int(m.group(1)) if m else None
+
+
+def text_schedule_kind(text: str) -> str | None:
+    if re.search(r"毎日|毎朝|毎晩|毎夜", text):
+        return "daily"
+    if re.search(r"毎週", text):
+        return "weekly"
+    return None
+
+
+def quoted_keyword(text: str) -> str:
+    m = re.search(r"[「『\"]([^」』\"]{1,80})[」』\"]", text)
+    if m:
+        return m.group(1).strip()
+    cleaned = strip_bot_mentions(text)
+    cleaned = re.sub(r"リマインダー?|リマインド|削除|消して|止めて|停止|解除|キャンセル|一覧|見せて|確認|できる|可能|して|ください|これ|それ|いま|今|の|を|は|って|だけど", " ", cleaned)
+    cleaned = re.sub(r"\d{1,4}\s*(?:分|時間|日)\s*(?:後|ごと|おき|毎|まい)?", " ", cleaned)
+    cleaned = re.sub(r"毎日|毎朝|毎晩|毎夜|毎週\s*[月火水木金土日]?曜?(?:日)?", " ", cleaned)
+    words = [w for w in re.split(r"\s+", cleaned.strip()) if len(w) >= 2]
+    return words[0][:80] if words else ""
+
+
+def reminder_matches(rem: dict, text: str, channel: str, requester_id: str, all_users: bool = False) -> bool:
+    if rem.get("status") != "scheduled":
+        return False
+    if channel and str(rem.get("channel_id") or "") != channel:
+        return False
+    if not all_users and requester_id and str(rem.get("requester_id") or "") != requester_id:
+        return False
+    if re.search(r"全部|すべて|全て", text):
+        return True
+
+    minute = text_minutes(text)
+    kind = text_schedule_kind(text)
+    keyword = quoted_keyword(text)
+    criteria = False
+
+    if minute is not None:
+        criteria = True
+        if f"{minute}分" not in str(rem.get("schedule_label") or ""):
+            return False
+    if kind is not None:
+        criteria = True
+        recurrence = rem.get("recurrence") if isinstance(rem.get("recurrence"), dict) else {}
+        if recurrence.get("kind") != kind:
+            return False
+    if keyword:
+        criteria = True
+        if keyword not in str(rem.get("body") or "") and keyword not in str(rem.get("schedule_label") or ""):
+            return False
+
+    return not criteria or criteria
+
+
+def public_reminder(rem: dict) -> dict:
+    return {
+        "id": rem.get("id"),
+        "body": rem.get("body"),
+        "channel_id": rem.get("channel_id"),
+        "channel_label": rem.get("channel_label"),
+        "next_run_at": rem.get("next_run_at"),
+        "schedule_label": rem.get("schedule_label"),
+        "timezone": rem.get("timezone"),
+        "mode": rem.get("mode"),
+        "recurrence": rem.get("recurrence"),
+    }
+
+
+def list_filtered(args: argparse.Namespace) -> int:
+    data = load_state()
+    reminders = active_reminders(data)
+    if args.channel:
+        reminders = [r for r in reminders if str(r.get("channel_id") or "") == args.channel]
+    if args.requester_id:
+        reminders = [r for r in reminders if str(r.get("requester_id") or "") == args.requester_id]
+    print(json.dumps({"ok": True, "reminders": [public_reminder(r) for r in reminders]}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cancel(args: argparse.Namespace) -> int:
+    with state_lock() as _lock:
+        data = load_state()
+        matches = [
+            rem for rem in active_reminders(data)
+            if reminder_matches(rem, args.text, args.channel or "", args.requester_id or "", args.all_users)
+        ]
+        if not matches:
+            print(json.dumps({"ok": True, "action": "none", "cancelled": [], "matched": []}, ensure_ascii=False, indent=2))
+            return 0
+        if len(matches) > 1 and not re.search(r"全部|すべて|全て", args.text):
+            print(json.dumps({"ok": True, "action": "ambiguous", "cancelled": [], "matched": [public_reminder(r) for r in matches]}, ensure_ascii=False, indent=2))
+            return 0
+        if args.dry_run:
+            print(json.dumps({"ok": True, "action": "dry_run", "cancelled": [], "matched": [public_reminder(r) for r in matches]}, ensure_ascii=False, indent=2))
+            return 0
+        cancelled = []
+        now = iso(now_local())
+        for rem in matches:
+            rem["status"] = "cancelled"
+            rem["cancelled_at"] = now
+            rem["updated_at"] = now
+            rem["cancelled_by"] = args.requester_id or ""
+            cancelled.append(public_reminder(rem))
+        save_state(data)
+    print(json.dumps({"ok": True, "action": "cancelled", "cancelled": cancelled, "matched": cancelled}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def create(args: argparse.Namespace) -> int:
+    run_at, schedule_label, recurrence, mode = parse_schedule(args.text)
+    channel_id, channel_label = target_channel(args.text, args.channel or "")
+    body = extract_body(args.text)
+    created = iso(now_local())
+    reminder = {
+        "id": "rem_" + secrets.token_hex(6),
+        "status": "scheduled",
+        "body": body,
+        "channel_id": channel_id,
+        "channel_label": channel_label,
+        "guild_id": args.guild or "",
+        "requester_id": args.requester_id or "",
+        "source_message_id": args.source_message_id or "",
+        "next_run_at": run_at,
+        "schedule_label": schedule_label,
+        "timezone": str(getattr(tzinfo(), "key", None) or tzinfo()),
+        "recurrence": recurrence,
+        "mode": mode,
+        "created_at": created,
+        "updated_at": created,
+    }
+    with state_lock() as _lock:
+        data = load_state()
+        data["reminders"].append(reminder)
+        save_state(data)
+    print(json.dumps({"ok": True, "reminder": reminder}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def discord_send(channel_id: str, content: str, requester_id: str = "") -> None:
+    token = ENV.get("DISCORD_BOT_TOKEN") or ENV.get("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError("DISCORD_BOT_TOKEN is not configured")
+    payload = {
+        "content": content[:MAX_DISCORD_CHARS],
+        "allowed_mentions": {"parse": [], "roles": [], "users": [requester_id] if requester_id else []},
+    }
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{channel_id}/messages",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if resp.status < 200 or resp.status >= 300:
+                raise RuntimeError(f"Discord send failed: HTTP {resp.status}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"Discord send failed: HTTP {exc.code}: {detail}") from exc
+
+
+def reminder_content(rem: dict) -> str:
+    requester = str(rem.get("requester_id") or "")
+    prefix = f"<@{requester}> さん、リマインダーです。" if requester else "リマインダーです。"
+    return f"{prefix}\n\n{rem.get('body', '').strip()}"
+
+
+def dispatch(args: argparse.Namespace) -> int:
+    local_now = now_local()
+    sent = []
+    errors = []
+    with state_lock() as _lock:
+        data = load_state()
+        changed = False
+        for rem in data.get("reminders", []):
+            if rem.get("status") != "scheduled":
+                continue
+            try:
+                due_at = parse_iso(rem["next_run_at"])
+            except Exception:
+                rem["status"] = "error"
+                rem["last_error"] = "invalid next_run_at"
+                changed = True
+                continue
+            if due_at > local_now:
+                continue
+            try:
+                discord_send(str(rem["channel_id"]), reminder_content(rem), str(rem.get("requester_id") or ""))
+                sent.append(rem["id"])
+                rec = rem.get("recurrence")
+                if isinstance(rec, dict):
+                    next_at = next_recurrence(due_at, rec)
+                    if next_at:
+                        rem["next_run_at"] = iso(next_at)
+                        rem["updated_at"] = iso(local_now)
+                        rem["last_sent_at"] = iso(local_now)
+                    else:
+                        rem["status"] = "done"
+                        rem["fired_at"] = iso(local_now)
+                else:
+                    rem["status"] = "done"
+                    rem["fired_at"] = iso(local_now)
+                    rem["updated_at"] = iso(local_now)
+                changed = True
+            except Exception as exc:
+                rem["last_error"] = str(exc)[:500]
+                rem["updated_at"] = iso(local_now)
+                errors.append({"id": rem.get("id"), "error": str(exc)})
+                changed = True
+        if changed:
+            save_state(data)
+    if errors:
+        print(json.dumps({"ok": False, "sent": sent, "errors": errors}, ensure_ascii=False), file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps({"ok": True, "sent": sent}, ensure_ascii=False))
+    return 0
+
+
+def list_reminders(args: argparse.Namespace) -> int:
+    data = load_state()
+    reminders = data.get("reminders", [])
+    if not args.all:
+        reminders = [r for r in reminders if r.get("status") == "scheduled"]
+    print(json.dumps({"ok": True, "reminders": reminders}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Safe Discord reminder helper for AI Nikechan")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_create = sub.add_parser("create")
+    p_create.add_argument("--text", required=True)
+    p_create.add_argument("--channel", required=True)
+    p_create.add_argument("--guild", default="")
+    p_create.add_argument("--requester-id", default="")
+    p_create.add_argument("--source-message-id", default="")
+    p_create.set_defaults(func=create)
+
+    p_dispatch = sub.add_parser("dispatch")
+    p_dispatch.add_argument("--json", action="store_true")
+    p_dispatch.set_defaults(func=dispatch)
+
+    p_list = sub.add_parser("list")
+    p_list.add_argument("--all", action="store_true")
+    p_list.add_argument("--channel", default="")
+    p_list.add_argument("--requester-id", default="")
+    p_list.set_defaults(func=list_filtered)
+
+    p_cancel = sub.add_parser("cancel")
+    p_cancel.add_argument("--text", required=True)
+    p_cancel.add_argument("--channel", default="")
+    p_cancel.add_argument("--requester-id", default="")
+    p_cancel.add_argument("--all-users", action="store_true")
+    p_cancel.add_argument("--dry-run", action="store_true")
+    p_cancel.set_defaults(func=cancel)
+
+    args = parser.parse_args()
+    try:
+        return int(args.func(args))
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

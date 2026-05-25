@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+base="${NIKECHAN_EMOTION_RELAY:-http://127.0.0.1:9819}"
+cmd="${1:-get}"
+shift || true
+case "$cmd" in
+  get) exec curl -fsS "$base/emotion-get" ;;
+  decay) exec curl -fsS -X POST "$base/emotion-decay" ;;
+  shift) exec curl -fsS -X POST "$base/emotion-shift" -H "content-type: application/json" -d "${1:-{}}" ;;
+  latest) exec curl -fsS "$base/emotion-log-latest" ;;
+  *) echo "usage: nikechan-emotion [get|decay|shift JSON|latest]" >&2; exit 2 ;;
+esac

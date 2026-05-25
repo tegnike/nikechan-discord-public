@@ -1,0 +1,276 @@
+#!/Users/nikenike/.hermes/hermes-agent/venv/bin/python
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+MAX_TITLE_CHARS = 90
+MAX_DETAILS_CHARS = 1800
+
+
+def load_env() -> dict[str, str]:
+    env = dict(os.environ)
+    candidates = []
+    if env.get("HERMES_HOME"):
+        candidates.append(Path(env["HERMES_HOME"]) / ".env")
+        candidates.append(Path(env["HERMES_HOME"]) / "profiles" / "nikechandiscord" / ".env")
+    candidates.append(Path.home() / ".hermes" / ".env")
+    candidates.append(Path.home() / ".hermes" / "profiles" / "nikechandiscord" / ".env")
+    candidates.append(Path.home() / "WorkSpace" / "nikechan-hermes-runtime" / "profiles" / "nikechandiscord" / ".env")
+    candidates.append(Path.home() / "WorkSpace" / "nikechan" / ".env")
+    extra = env.get("NIKECHAN_ENV_FILES") or env.get("NIKECHAN_DB_ENV_FILES")
+    if extra:
+        candidates.extend(Path(part).expanduser() for part in extra.split(":") if part.strip())
+    for path in candidates:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            key, value = raw.split("=", 1)
+            env.setdefault(key.strip(), value.strip().strip("\"'"))
+    return env
+
+
+ENV = load_env()
+
+
+def json_out(payload: dict) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def supabase_request(method: str, endpoint: str, body: dict | None = None):
+    url = (ENV.get("SUPABASE_URL") or "").rstrip("/")
+    key = ENV.get("SUPABASE_SERVICE_ROLE_KEY") or ENV.get("SUPABASE_ANON_KEY") or ""
+    if not url or not key:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required")
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        f"{url}/rest/v1/{endpoint}",
+        data=data,
+        method=method,
+        headers={
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:1000]
+        raise RuntimeError(f"Supabase HTTP {exc.code}: {detail}") from exc
+    return json.loads(text) if text else None
+
+
+def clean_text(text: str) -> str:
+    text = re.sub(r"<@!?\d+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" 　")
+
+
+def fallback_extract(text: str) -> dict:
+    cleaned = clean_text(text)
+    title = cleaned
+    terminal = re.search(
+        r"(.+?)(?:[、,。]\s*)?(?:を|って|というのを)?\s*(?:todo|TODO|タスク|要望|改善案|課題|バックログ)(?:に|へ)?(?:追加|登録|入れて|入れといて|メモして|残して)\s*(?:して)?\s*(?:ください|お願い)?$",
+        cleaned,
+        flags=re.I,
+    )
+    if terminal:
+        title = terminal.group(1).strip(" 　。、「」『』")
+        return {
+            "ok": True,
+            "title": title[:MAX_TITLE_CHARS],
+            "details": cleaned[:MAX_DETAILS_CHARS],
+            "priority": "medium",
+            "source": "fallback",
+        }
+    patterns = [
+        r"(?:todo|TODO|タスク|要望|改善案|課題)(?:に|へ)?(?:追加|登録|入れて|入れといて|メモして|残して)\s*[:：]?\s*(.+)",
+        r"(.+?)(?:を|って|というのを)?\s*(?:todo|TODO|タスク|要望|改善案|課題)(?:に|へ)?(?:追加|登録|入れて|入れといて|メモして|残して)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, cleaned, flags=re.I)
+        if match:
+            title = match.group(1).strip(" 　。、「」『』")
+            break
+    title = re.sub(r"^(これ|それ|この要望|この件|今の話|さっきの話)\s*", "", title).strip(" 　。、「」『』")
+    title = re.sub(r"(?:ください|お願い|して)$", "", title).strip(" 　。、「」『』")
+    if not title or len(title) < 3:
+        return {"ok": False, "error": "todo化する内容を読み取れませんでした。"}
+    return {
+        "ok": True,
+        "title": title[:MAX_TITLE_CHARS],
+        "details": cleaned[:MAX_DETAILS_CHARS],
+        "priority": "medium",
+        "source": "fallback",
+    }
+
+
+def llm_extract(text: str) -> dict | None:
+    if ENV.get("NIKECHAN_DISABLE_LLM_TODO_EXTRACT") == "1":
+        return None
+    api_key = ENV.get("ALIBABA_CODING_PLAN_API_KEY") or ENV.get("DASHSCOPE_API_KEY")
+    if not api_key:
+        return None
+    base_url = (ENV.get("ALIBABA_CODING_PLAN_BASE_URL") or "https://coding-intl.dashscope.aliyuncs.com/v1").rstrip("/")
+    model = ENV.get("HERMES_INFERENCE_MODEL") or "qwen3.6-plus"
+    prompt = (
+        "Discordに投稿された日本語メッセージから、todoに追加すべき要望・改善案・作業内容を抽出してください。\n"
+        "返答はJSONだけにしてください。\n"
+        "schema: {\"ok\":true,\"title\":\"90字以内のtodoタイトル\",\"details\":\"補足。なければ空文字\",\"priority\":\"low|medium|high\"}\n"
+        "todo化する内容が不明な場合は {\"ok\":false,\"error\":\"...\"}。\n"
+        "挨拶、雑談、単なる質問、モデレーション依頼はtodoにしない。\n"
+        "titleは命令文ではなく作業タイトルにする。\n\n"
+        f"message: {text}"
+    )
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You extract one actionable todo item. Output JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 300,
+    }
+    req = urllib.request.Request(
+        base_url + "/chat/completions",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        match = re.search(r"\{.*\}", content, flags=re.S)
+        parsed = json.loads(match.group(0) if match else content)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    parsed["source"] = "llm"
+    return parsed
+
+
+def normalize_extract(parsed: dict) -> dict:
+    if not parsed.get("ok"):
+        return {"ok": False, "error": str(parsed.get("error") or "todo化する内容を読み取れませんでした。")[:300]}
+    title = clean_text(str(parsed.get("title") or ""))
+    details = clean_text(str(parsed.get("details") or ""))
+    priority = str(parsed.get("priority") or "medium").lower()
+    if priority not in {"low", "medium", "high"}:
+        priority = "medium"
+    if not title or len(title) < 3:
+        return {"ok": False, "error": "todoタイトルを読み取れませんでした。"}
+    return {
+        "ok": True,
+        "title": title[:MAX_TITLE_CHARS],
+        "details": details[:MAX_DETAILS_CHARS],
+        "priority": priority,
+        "source": parsed.get("source") or "unknown",
+    }
+
+
+def jump_url(guild: str, channel: str, message: str) -> str:
+    if guild and channel and message:
+        return f"https://discord.com/channels/{guild}/{channel}/{message}"
+    return ""
+
+
+def add(args: argparse.Namespace) -> int:
+    extracted = normalize_extract(llm_extract(args.text) or fallback_extract(args.text))
+    if not extracted.get("ok"):
+        json_out(extracted)
+        return 2
+
+    source_url = jump_url(args.guild or "", args.channel or "", args.source_message_id or "")
+    task_body = {
+        "title": extracted["title"],
+        "status": "todo",
+        "priority": extracted["priority"],
+    }
+    note_content = "\n".join(
+        part
+        for part in [
+            f"Discordから追加された要望です。",
+            f"登録日時: {dt.datetime.now(dt.timezone.utc).isoformat()}",
+            f"投稿者ID: {args.requester_id or 'unknown'}",
+            f"チャンネルID: {args.channel or 'unknown'}",
+            f"元メッセージ: {source_url}" if source_url else "",
+            "",
+            "抽出内容:",
+            extracted.get("details") or extracted["title"],
+            "",
+            "元の投稿:",
+            clean_text(args.text),
+        ]
+        if part is not None
+    )
+
+    if args.dry_run:
+        json_out({"ok": True, "dry_run": True, "task": task_body, "note_content": note_content, "extract_source": extracted.get("source")})
+        return 0
+
+    task_rows = supabase_request("POST", "local_tasks", task_body) or []
+    task = task_rows[0] if isinstance(task_rows, list) and task_rows else {}
+    task_id = task.get("id")
+    note = {}
+    if task_id:
+        note_body = {
+            "title": f"Discord要望: {extracted['title']}"[:120],
+            "content": note_content,
+            "type": "task",
+            "tags": ["discord", "request", "todo"],
+            "task_id": task_id,
+        }
+        note_rows = supabase_request("POST", "local_notes", note_body) or []
+        note = note_rows[0] if isinstance(note_rows, list) and note_rows else {}
+
+    json_out(
+        {
+            "ok": True,
+            "task": task,
+            "note": note,
+            "source_url": source_url,
+            "extract_source": extracted.get("source"),
+        }
+    )
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Add Discord-raised requests to Nikechan local_tasks")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_add = sub.add_parser("add")
+    p_add.add_argument("--text", required=True)
+    p_add.add_argument("--channel", default="")
+    p_add.add_argument("--guild", default="")
+    p_add.add_argument("--requester-id", default="")
+    p_add.add_argument("--source-message-id", default="")
+    p_add.add_argument("--dry-run", action="store_true")
+    p_add.set_defaults(func=add)
+
+    args = parser.parse_args()
+    try:
+        return int(args.func(args))
+    except Exception as exc:
+        json_out({"ok": False, "error": str(exc)})
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,414 @@
+#!/Users/nikenike/.hermes/hermes-agent/venv/bin/python
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+API = "https://discord.com/api/v10"
+ADMINISTRATOR = 1 << 3
+MODERATE_MEMBERS = 1 << 40
+DEFAULT_SHORTEN_STRONG = "1h"
+DEFAULT_SHORTEN_WEAK = "3h"
+
+POSITIVE_PATTERNS = [
+    (r"(申し訳|すみません|ごめん|謝罪|お詫び)", 2),
+    (r"(反省|軽率|不適切|迷惑|悪かった|よくなかった)", 2),
+    (r"(二度と|今後.*しません|繰り返しません|再発防止|気をつけます|控えます)", 2),
+    (r"(ルール|規約|サーバー).*?(守|確認|理解)", 2),
+    (r"(everyone|here|メンション|勧誘|外部連絡|Chatwork|チャットワーク|投稿).*?(しません|控え|やめ|反省)", 2),
+    (r"(削除|撤回|取り下げ)", 1),
+]
+NEGATIVE_PATTERNS = [
+    (r"(でも|だって|ただ|とはいえ|悪気はない|冗談|ネタ|そんなつもり|知らなかっただけ)", -2),
+    (r"(早く解除|解除しろ|納得できない|意味わから|なんで|許せ)", -3),
+    (r"(またやる|別に|大げさ|うるさい)", -5),
+]
+
+
+def load_env() -> dict:
+    env = dict(os.environ)
+    candidates: list[Path] = []
+    if env.get("HERMES_PROFILE_DIR"):
+        candidates.append(Path(env["HERMES_PROFILE_DIR"]) / ".env")
+    home = Path(env.get("HERMES_HOME") or Path.home() / ".hermes")
+    candidates.append(home / ".env")
+    profile = env.get("HERMES_PROFILE") or env.get("HERMES_PROFILE_NAME")
+    if profile:
+        candidates.append(home / "profiles" / profile / ".env")
+    candidates.extend([
+        home / "profiles" / "nikechandiscord" / ".env",
+    ])
+    for path in candidates:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            key, value = raw.split("=", 1)
+            env.setdefault(key.strip(), value.strip().strip("\"'"))
+    return env
+
+
+ENV = load_env()
+TOKEN = ENV.get("DISCORD_BOT_TOKEN", "").strip()
+HOME = Path(ENV.get("HERMES_HOME") or Path.home() / ".hermes")
+STATE_DIR = HOME / "local" / "discord-amnesty"
+AUDIT = STATE_DIR / "audit.jsonl"
+FREEZE_AUDIT = HOME / "local" / "discord-freeze" / "audit.jsonl"
+ALLOWED_GUILDS = {g.strip() for g in ENV.get("DISCORD_ALLOWED_GUILDS", "").split(",") if g.strip()}
+
+
+class DiscordError(RuntimeError):
+    pass
+
+
+def request(method: str, path: str, body: dict | None = None):
+    if not TOKEN:
+        raise DiscordError("DISCORD_BOT_TOKEN is not configured")
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        API + path,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bot {TOKEN}",
+            "Content-Type": "application/json",
+            "User-Agent": "nikechan-hermes-discord-amnesty/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if resp.status == 204:
+                return None
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace")
+        raise DiscordError(f"Discord API {exc.code}: {body_text[:1000]}") from exc
+
+
+def iso_utc(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_time(value: str | None) -> dt.datetime | None:
+    if not value:
+        return None
+    try:
+        raw = value[:-1] + "+00:00" if value.endswith("Z") else value
+        parsed = dt.datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def parse_duration(value: str) -> int:
+    m = re.fullmatch(r"(\d+)([smhd])", value.strip().lower())
+    if not m:
+        raise ValueError("duration must look like 30m, 2h, or 1d")
+    n = int(m.group(1))
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def assert_allowed_guild(guild_id: str):
+    if ALLOWED_GUILDS and guild_id not in ALLOWED_GUILDS:
+        allowed = ", ".join(sorted(ALLOWED_GUILDS))
+        raise DiscordError(f"guild is outside allowed server: guild_id={guild_id} allowed_guilds={allowed}")
+
+
+def roles(guild_id: str) -> dict:
+    return {r["id"]: r for r in request("GET", f"/guilds/{guild_id}/roles")}
+
+
+def member(guild_id: str, user_id: str) -> dict:
+    return request("GET", f"/guilds/{guild_id}/members/{user_id}")
+
+
+def permissions_for(guild_id: str, user_id: str, role_map: dict) -> int:
+    m = member(guild_id, user_id)
+    perms = int(role_map.get(guild_id, {}).get("permissions", 0))
+    for rid in m.get("roles", []):
+        perms |= int(role_map.get(rid, {}).get("permissions", 0))
+    return perms
+
+
+def assert_requester_allowed(guild_id: str, requester_id: str) -> dict:
+    if not requester_id:
+        raise DiscordError("requester id is required for amnesty")
+    guild = request("GET", f"/guilds/{guild_id}")
+    if requester_id == guild.get("owner_id"):
+        return {"ok": True, "basis": "server_owner"}
+    role_map = roles(guild_id)
+    perms = permissions_for(guild_id, requester_id, role_map)
+    if perms & ADMINISTRATOR:
+        return {"ok": True, "basis": "administrator"}
+    if perms & MODERATE_MEMBERS:
+        return {"ok": True, "basis": "moderate_members"}
+    raise DiscordError("amnesty can only be requested by server owner, Administrator, or Moderate Members")
+
+
+def bot_can_moderate(guild_id: str):
+    role_map = roles(guild_id)
+    bot = request("GET", "/users/@me")
+    perms = permissions_for(guild_id, bot["id"], role_map)
+    if not (perms & MODERATE_MEMBERS):
+        raise DiscordError("bot lacks Moderate Members permission")
+
+
+def write_audit(entry: dict):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with AUDIT.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def load_freeze_entries(guild_id: str) -> list[dict]:
+    entries: list[dict] = []
+    if not FREEZE_AUDIT.exists():
+        return entries
+    for line in FREEZE_AUDIT.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if entry.get("guild_id") == guild_id and entry.get("event") in {"apply", "prepare"}:
+            entries.append(entry)
+    return entries
+
+
+def current_timeout_until(guild_id: str, user_id: str) -> dt.datetime | None:
+    data = member(guild_id, user_id)
+    return parse_time(data.get("communication_disabled_until"))
+
+
+def latest_freeze_for(guild_id: str, user_id: str) -> dict | None:
+    entries = [e for e in load_freeze_entries(guild_id) if e.get("target_user_id") == user_id]
+    if not entries:
+        return None
+    return entries[-1]
+
+
+def active_freeze_candidates(guild_id: str) -> list[dict]:
+    now = dt.datetime.now(dt.timezone.utc)
+    latest_by_user: dict[str, dict] = {}
+    for entry in load_freeze_entries(guild_id):
+        user_id = entry.get("target_user_id")
+        until = parse_time(entry.get("until"))
+        if not user_id or not until or until <= now:
+            continue
+        latest_by_user[user_id] = entry
+    active = []
+    for user_id, entry in latest_by_user.items():
+        try:
+            until = current_timeout_until(guild_id, user_id)
+        except Exception:
+            until = parse_time(entry.get("until"))
+        if until and until > now:
+            active.append({**entry, "current_until": iso_utc(until)})
+    return active
+
+
+def normalize_name(value: str) -> str:
+    return re.sub(r"\s+", "", value or "").lower()
+
+
+def resolve_target(guild_id: str, target: str | None, apology: str) -> tuple[str, dict | None]:
+    text = " ".join(x for x in [target or "", apology] if x)
+    m = re.search(r"<@!?(\d+)>", text)
+    if m:
+        uid = m.group(1)
+        return uid, latest_freeze_for(guild_id, uid)
+    m = re.search(r"(?:user[-_ ]?id|ユーザーid|対象)[:：\s]+(\d{15,25})", text, flags=re.I)
+    if m:
+        uid = m.group(1)
+        return uid, latest_freeze_for(guild_id, uid)
+    if target and target.strip().isdigit():
+        uid = target.strip()
+        return uid, latest_freeze_for(guild_id, uid)
+
+    active = active_freeze_candidates(guild_id)
+    name = normalize_name(target or "")
+    if name:
+        matches = []
+        for entry in active:
+            candidates = [entry.get("target_username"), entry.get("target_display_name"), entry.get("target_user_id")]
+            if any(name and name in normalize_name(c or "") for c in candidates):
+                matches.append(entry)
+        if len(matches) == 1:
+            return matches[0]["target_user_id"], matches[0]
+        if len(matches) > 1:
+            raise DiscordError("target name is ambiguous; mention the user or provide user id")
+
+    if not target and len(active) == 1:
+        return active[0]["target_user_id"], active[0]
+    raise DiscordError("could not resolve target; mention the frozen user or provide user id")
+
+
+def score_apology(apology: str) -> tuple[int, list[str]]:
+    score = 0
+    signals: list[str] = []
+    compact = re.sub(r"\s+", " ", apology).strip()
+    for pattern, points in POSITIVE_PATTERNS:
+        if re.search(pattern, compact, flags=re.I):
+            score += points
+            signals.append(pattern)
+    for pattern, points in NEGATIVE_PATTERNS:
+        if re.search(pattern, compact, flags=re.I):
+            score += points
+            signals.append(pattern)
+    if len(compact) >= 80:
+        score += 1
+        signals.append("specific_length")
+    if len(compact) < 15:
+        score -= 2
+        signals.append("too_short")
+    return score, signals
+
+
+def judge(apology: str, current_until: dt.datetime | None) -> dict:
+    now = dt.datetime.now(dt.timezone.utc)
+    score, signals = score_apology(apology)
+    if current_until and current_until <= now:
+        return {"decision": "already_expired", "score": score, "signals": signals, "new_until": None}
+    if score >= 6:
+        return {"decision": "release", "score": score, "signals": signals, "new_until": None}
+    if score >= 3:
+        new_until = now + dt.timedelta(seconds=parse_duration(DEFAULT_SHORTEN_STRONG))
+        return {"decision": "shorten", "score": score, "signals": signals, "new_until": iso_utc(new_until)}
+    if score >= 1:
+        new_until = now + dt.timedelta(seconds=parse_duration(DEFAULT_SHORTEN_WEAK))
+        return {"decision": "shorten", "score": score, "signals": signals, "new_until": iso_utc(new_until)}
+    return {"decision": "keep", "score": score, "signals": signals, "new_until": iso_utc(current_until) if current_until else None}
+
+
+def apply_decision(guild_id: str, user_id: str, decision: dict, reason: str) -> dict:
+    if decision["decision"] == "release":
+        request("PATCH", f"/guilds/{guild_id}/members/{user_id}", {"communication_disabled_until": None})
+        return {"applied": True, "action": "released", "until": None}
+    if decision["decision"] == "shorten":
+        new_until = parse_time(decision.get("new_until"))
+        current = current_timeout_until(guild_id, user_id)
+        if current and new_until and new_until < current:
+            request("PATCH", f"/guilds/{guild_id}/members/{user_id}", {"communication_disabled_until": iso_utc(new_until)})
+            return {"applied": True, "action": "shortened", "until": iso_utc(new_until)}
+        return {"applied": False, "action": "kept_existing_shorter_or_equal", "until": iso_utc(current) if current else None}
+    return {"applied": False, "action": decision["decision"], "until": decision.get("new_until")}
+
+
+def format_result(result: dict) -> str:
+    target = result.get("target_display_name") or result.get("target_username") or result.get("target_user_id")
+    decision = result.get("decision")
+    if decision == "release":
+        label = "完全解除"
+    elif decision == "shorten":
+        label = "短縮"
+    elif decision == "already_expired":
+        label = "既に解除済み"
+    else:
+        label = "維持"
+    lines = ["Discord凍結恩赦の判定を実行しました。"]
+    lines.append(f"ユーザ名: {target}")
+    lines.append(f"判断: {label}")
+    lines.append(f"謝罪スコア: {result.get('score')}")
+    if result.get("original_until"):
+        lines.append(f"元の解除時間: {result.get('original_until')}")
+    if result.get("until"):
+        lines.append(f"新しい解除時間: {result.get('until')}")
+    elif decision == "release":
+        lines.append("新しい解除時間: 即時解除")
+    if result.get("freeze_reason"):
+        lines.append(f"元の罪状: {result.get('freeze_charge') or result.get('freeze_reason')}")
+    lines.append(f"理由: {result.get('reason_summary')}")
+    lines.append(f"audit_id: {result.get('audit_id')}")
+    return "\n".join(lines)
+
+
+def cmd_evaluate(args) -> int:
+    assert_allowed_guild(args.guild)
+    auth = assert_requester_allowed(args.guild, args.requester_id)
+    bot_can_moderate(args.guild)
+    user_id, freeze_entry = resolve_target(args.guild, args.target, args.apology)
+    current = current_timeout_until(args.guild, user_id)
+    if not current or current <= dt.datetime.now(dt.timezone.utc):
+        decision = {"decision": "already_expired", "score": 0, "signals": [], "new_until": None}
+    else:
+        decision = judge(args.apology, current)
+    applied = {"applied": False, "action": "dry_run", "until": decision.get("new_until")}
+    if args.apply and decision["decision"] not in {"already_expired"}:
+        applied = apply_decision(args.guild, user_id, decision, "amnesty")
+
+    user = member(args.guild, user_id).get("user", {})
+    audit_id = hashlib.sha256(
+        f"{args.guild}:{user_id}:{args.requester_id}:{args.apology}:{dt.datetime.now(dt.timezone.utc).isoformat()}".encode()
+    ).hexdigest()[:16]
+    reason_summary = {
+        "release": "謝罪に反省、再発防止、対象行為への理解が十分に含まれているため。",
+        "shorten": "謝罪意思は確認できるが、完全解除には少し具体性が足りないため。",
+        "keep": "謝罪または再発防止の具体性が不足しているため。",
+        "already_expired": "現在有効なtimeoutが確認できないため。",
+    }.get(decision["decision"], "判定不能")
+    result = {
+        "type": "discord-amnesty",
+        "audit_id": audit_id,
+        "guild_id": args.guild,
+        "target_user_id": user_id,
+        "target_username": user.get("username"),
+        "target_display_name": user.get("global_name") or user.get("username"),
+        "requester_id": args.requester_id,
+        "requester_authority": auth["basis"],
+        "source_message_id": args.source_message_id,
+        "decision": decision["decision"],
+        "score": decision["score"],
+        "signals": decision["signals"],
+        "original_until": iso_utc(current) if current else None,
+        "until": applied.get("until"),
+        "applied": applied.get("applied"),
+        "applied_action": applied.get("action"),
+        "freeze_reason": (freeze_entry or {}).get("reason"),
+        "freeze_charge": (freeze_entry or {}).get("charge"),
+        "reason_summary": reason_summary,
+        "created_at": iso_utc(dt.datetime.now(dt.timezone.utc)),
+    }
+    write_audit(result)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(format_result(result))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Evaluate and apply Discord timeout amnesty.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("evaluate")
+    p.add_argument("--guild", required=True)
+    p.add_argument("--target", default="")
+    p.add_argument("--apology", required=True)
+    p.add_argument("--requester-id", required=True)
+    p.add_argument("--source-message-id", default="")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.cmd == "evaluate":
+            return cmd_evaluate(args)
+    except (DiscordError, ValueError) as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

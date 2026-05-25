@@ -16,6 +16,7 @@ AIニケちゃん公開Discord常駐Botの Hermes profile です。
 - `memories/`
 - `skills/` 配下のニケちゃん独自skill
 - `scripts/`
+- `bin/` 配下のDiscord/音楽解析/モデレーション補助CLI
 - `plugins/`
 - `cron/jobs.template.json`
 
@@ -28,3 +29,11 @@ AIニケちゃん公開Discord常駐Botの Hermes profile です。
 - `cron/jobs.json`
 
 `cron/jobs.json` はHermesが実行回数や次回実行時刻を毎分更新するため、Git管理しません。cron定義を変更した場合は `cron/jobs.template.json` にも反映してください。
+
+## live symlink
+
+profile外から呼ばれる補助CLIは `~/.hermes/bin/*` からこのrepoの `bin/*` へsymlinkします。
+
+`~/.hermes/scripts` はこのrepoの `scripts/` へsymlinkします。
+
+旧 `~/WorkSpace/nikechan-hermes-runtime` は不要です。

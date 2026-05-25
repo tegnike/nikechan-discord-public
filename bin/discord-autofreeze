@@ -1,0 +1,394 @@
+#!/Users/nikenike/.hermes/hermes-agent/venv/bin/python
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+
+HISTORY = "/Users/nikenike/.hermes/bin/discord-history"
+FREEZE = "/Users/nikenike/.hermes/bin/discord-freeze"
+DEFAULT_WINDOW_MINUTES = 5
+DEFAULT_DURATION = "12h"
+DEFAULT_LIMIT_PER_CHANNEL = 80
+MESSAGE_FLOOD_THRESHOLD = 14
+DUPLICATE_THRESHOLD = 5
+MENTIONS_IN_ONE_MESSAGE_THRESHOLD = 8
+MENTIONS_TOTAL_THRESHOLD = 20
+COOLDOWN_SECONDS = 60 * 60
+SOLICITATION_CONTACT_RE = re.compile(
+    r"(chatwork|チャットワーク|telegram|テレグラム|line\s*id|ライン\s*id|whatsapp|skype|"
+    r"連絡先|contact|@[a-z0-9_.-]{4,}|[a-z0-9_.+-]+@[a-z0-9_.-]+\.[a-z]{2,})",
+    re.I,
+)
+SOLICITATION_WORK_RE = re.compile(
+    r"(案件|web\s*開発|webソリューション|クライアント|日本向け|日本語.*(?:サポート|確認|やり取り)|"
+    r"協力|手伝|補助|確認が中心|特別なスキル|収益|報酬|お支払い|副業|仕事|business|client|"
+    r"revenue|payment|commission)",
+    re.I,
+)
+SOLICITATION_OPENER_RE = re.compile(
+    r"(突然の投稿失礼|突然失礼|はじめまして|興味があれば|お気軽に|よろしくお願いします|"
+    r"looking for|if interested|feel free)",
+    re.I,
+)
+
+
+def load_env() -> dict:
+    env = dict(os.environ)
+    homes = []
+    if env.get("HERMES_HOME"):
+        homes.append(Path(env["HERMES_HOME"]))
+    homes.append(Path.home() / ".hermes")
+    for home in homes:
+        p = home / ".env"
+        if not p.exists():
+            continue
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            k, v = raw.split("=", 1)
+            env.setdefault(k.strip(), v.strip().strip("\"'"))
+    return env
+
+
+ENV = load_env()
+HOME = Path(ENV.get("HERMES_HOME") or Path.home() / ".hermes")
+STATE_DIR = HOME / "local" / "discord-autofreeze"
+DECISIONS = STATE_DIR / "decisions.jsonl"
+
+
+def iso_utc(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def run_json(args: list[str], timeout: int = 45) -> dict:
+    proc = subprocess.run(args, text=True, capture_output=True, timeout=timeout, env=ENV)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"{' '.join(args[:2])} failed: {detail}")
+    return json.loads(proc.stdout)
+
+
+def normalized_content(message: dict) -> str:
+    content = (message.get("content") or "").lower()
+    content = re.sub(r"https?://\S+", "<url>", content)
+    content = re.sub(r"<@[!&]?\d+>", "<mention>", content)
+    content = re.sub(r"\s+", " ", content).strip()
+    return content
+
+
+def mention_count(message: dict) -> int:
+    content = message.get("content") or ""
+    count = len(re.findall(r"<@[!&]?\d+>", content))
+    count += len(re.findall(r"@(everyone|here)\b", content, flags=re.I)) * 8
+    return count
+
+
+def solicitation_score(message: dict) -> tuple[int, list[str]]:
+    content = message.get("content") or ""
+    compact = re.sub(r"\s+", " ", content).strip()
+    score = 0
+    signals = []
+    if len(compact) >= 120:
+        score += 1
+        signals.append("long_unsolicited_style_message")
+    if SOLICITATION_CONTACT_RE.search(compact):
+        score += 2
+        signals.append("external_contact")
+    if SOLICITATION_WORK_RE.search(compact):
+        matches = {m.group(0).lower() for m in SOLICITATION_WORK_RE.finditer(compact)}
+        score += min(3, len(matches))
+        signals.append("work_or_payment_solicitation")
+    if SOLICITATION_OPENER_RE.search(compact):
+        score += 1
+        signals.append("unsolicited_opener")
+    return score, signals
+
+
+def message_ts(message: dict) -> dt.datetime | None:
+    raw = message.get("timestamp")
+    if not raw:
+        return None
+    value = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        return dt.datetime.fromisoformat(value).astimezone(dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def recent_freeze(user_id: str, now: dt.datetime) -> bool:
+    if not DECISIONS.exists():
+        return False
+    cutoff = now - dt.timedelta(seconds=COOLDOWN_SECONDS)
+    for line in DECISIONS.read_text(encoding="utf-8", errors="replace").splitlines()[-500:]:
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+            if entry.get("target_user_id") != user_id or entry.get("status") not in {"applied", "dry_run"}:
+                continue
+            created = dt.datetime.fromisoformat(entry["created_at"].replace("Z", "+00:00"))
+            if created >= cutoff:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def append_decision(entry: dict):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with DECISIONS.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def evidence_link(guild_id: str, message: dict) -> str | None:
+    jump_url = message.get("jump_url")
+    if jump_url:
+        return jump_url
+    channel_id = message.get("_channel_id")
+    message_id = message.get("id")
+    if guild_id and channel_id and message_id:
+        return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+    return None
+
+
+def charge_for(reason: str | None, sample: str = "") -> str:
+    text = f"{reason or ''} {sample}".lower()
+    if "external-contact business solicitation" in text:
+        if "chatwork" in text or "チャットワーク" in text:
+            return "Chatwork誘導案件勧誘罪"
+        if "line" in text or "telegram" in text or "whatsapp" in text:
+            return "外部連絡先誘導案件勧誘罪"
+        return "外部連絡先つき案件勧誘罪"
+    if "message flood" in text:
+        return "短時間大量投稿罪"
+    if "duplicate message" in text:
+        return "同一文面連投罪"
+    if "excessive mentions" in text:
+        return "大量メンション罪"
+    return "サーバー迷惑行為罪"
+
+
+def collect_messages(guild: str, since: str, limit: int) -> tuple[list[dict], list[str], int]:
+    channels_data = run_json([HISTORY, "list-channels", "--guild", guild])
+    messages: list[dict] = []
+    errors: list[str] = []
+    skipped_inaccessible = 0
+    for channel in channels_data.get("channels", []):
+        channel_id = channel["id"]
+        try:
+            data = run_json(
+                [HISTORY, "fetch", "--channel", channel_id, "--guild", guild, "--from", since, "--limit", str(limit)],
+                timeout=45,
+            )
+        except Exception as e:
+            detail = str(e)
+            if "Missing Access" in detail or '"code": 50001' in detail:
+                skipped_inaccessible += 1
+            else:
+                errors.append(f"{channel.get('name') or channel_id}: {detail}")
+            continue
+        for msg in data.get("messages", []):
+            author = msg.get("author") or {}
+            if author.get("bot"):
+                continue
+            msg["_channel_id"] = channel_id
+            msg["_channel_name"] = channel.get("name")
+            messages.append(msg)
+        time.sleep(0.15)
+    return messages, errors, skipped_inaccessible
+
+
+def decide(messages: list[dict], now: dt.datetime) -> list[dict]:
+    by_user: dict[str, list[dict]] = defaultdict(list)
+    for msg in messages:
+        user_id = ((msg.get("author") or {}).get("id") or "").strip()
+        if user_id:
+            by_user[user_id].append(msg)
+
+    decisions = []
+    for user_id, user_messages in by_user.items():
+        if recent_freeze(user_id, now):
+            continue
+
+        duplicate_counter = Counter(
+            normalized_content(m) for m in user_messages if len(normalized_content(m)) >= 8
+        )
+        top_text, top_count = duplicate_counter.most_common(1)[0] if duplicate_counter else ("", 0)
+        total_mentions = sum(mention_count(m) for m in user_messages)
+        max_mentions = max((mention_count(m) for m in user_messages), default=0)
+        top_solicitation = max((solicitation_score(m) + (m,) for m in user_messages), key=lambda item: item[0])
+        solicitation_points, solicitation_signals, solicitation_message = top_solicitation
+
+        reason = None
+        evidence = sorted(
+            user_messages,
+            key=lambda m: message_ts(m) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+        )[-5:]
+
+        if len(user_messages) >= MESSAGE_FLOOD_THRESHOLD:
+            reason = f"automated moderation: message flood ({len(user_messages)} messages in window)"
+        elif top_count >= DUPLICATE_THRESHOLD:
+            reason = f"automated moderation: repeated duplicate message ({top_count} times)"
+        elif max_mentions >= MENTIONS_IN_ONE_MESSAGE_THRESHOLD:
+            reason = f"automated moderation: excessive mentions in one message ({max_mentions})"
+        elif total_mentions >= MENTIONS_TOTAL_THRESHOLD:
+            reason = f"automated moderation: excessive mentions in window ({total_mentions})"
+        elif solicitation_points >= 5 and "external_contact" in solicitation_signals:
+            reason = "automated moderation: unsolicited external-contact business solicitation"
+            evidence = [solicitation_message]
+
+        if reason:
+            author = user_messages[-1].get("author") or {}
+            decisions.append(
+                {
+                    "target_user_id": user_id,
+                    "target_username": author.get("username"),
+                    "target_display_name": author.get("display_name"),
+                    "reason": reason,
+                    "charge": charge_for(reason, top_text),
+                    "evidence_message_ids": [m.get("id") for m in evidence if m.get("id")],
+                    "evidence_links": [
+                        link for link in (evidence_link(m.get("guild_id") or "", m) for m in evidence) if link
+                    ],
+                    "evidence_channels": sorted({m.get("_channel_name") or m.get("_channel_id") for m in evidence}),
+                    "duplicate_sample": top_text[:120],
+                }
+            )
+    return decisions
+
+
+def apply_freeze(guild: str, duration: str, decision: dict, dry_run: bool) -> dict:
+    now = dt.datetime.now(dt.timezone.utc)
+    result = {
+        **decision,
+        "guild_id": guild,
+        "duration": duration,
+        "created_at": iso_utc(now),
+        "status": "dry_run" if dry_run else "pending",
+    }
+    if dry_run:
+        append_decision(result)
+        return result
+
+    source_message_id = ""
+    if decision.get("evidence_message_ids"):
+        source_message_id = decision["evidence_message_ids"][-1] or ""
+    prepared = run_json(
+        [
+            FREEZE,
+            "prepare",
+            "--guild",
+            guild,
+            "--user-id",
+            decision["target_user_id"],
+            "--duration",
+            duration,
+            "--reason",
+            decision["reason"],
+            "--executor-id",
+            "nikechan-autofreeze-cron",
+            "--source-message-id",
+            source_message_id,
+        ]
+    )
+    applied = run_json([FREEZE, "apply", "--action-id", prepared["action_id"], "--approval-message-id", "cron-autonomous"])
+    result.update(
+        {
+            "status": "applied",
+            "action_id": applied.get("action_id"),
+            "until": applied.get("until"),
+            "applied_at": applied.get("applied_at"),
+        }
+    )
+    append_decision(result)
+    return result
+
+
+def format_report(report: dict) -> str:
+    actions = report.get("actions") or []
+    errors = report.get("errors") or []
+    lines = []
+    if actions:
+        lines.append("Discord自律モデレーションを実行しました。")
+        for action in actions:
+            user = action.get("target_display_name") or action.get("target_username") or action.get("target_user_id")
+            status = action.get("status")
+            channel = ", ".join(action.get("evidence_channels") or [])
+            charge = action.get("charge") or charge_for(action.get("reason"), action.get("duplicate_sample") or "")
+            links = action.get("evidence_links") or []
+            if not links and action.get("guild_id") and action.get("evidence_message_ids"):
+                links = [", ".join(action["evidence_message_ids"])]
+            lines.append(f"ユーザ名: {user}")
+            if channel:
+                lines.append(f"対象チャンネル: {channel}")
+            lines.append(f"罪状: {charge}")
+            lines.append(f"証拠メッセージ: {links[0] if links else '不明'}")
+            if status == "applied":
+                lines.append(f"解除時間: {action.get('until')}")
+            elif status == "dry_run":
+                lines.append(f"解除時間: dry-runのため未適用")
+            else:
+                lines.append(f"解除時間: 実行失敗")
+                lines.append(f"エラー: {action.get('error')}")
+    if errors:
+        lines.append("取得エラーがありました。")
+        for error in errors[:3]:
+            lines.append(f"- {error}")
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Autonomous Discord timeout checker for AI Nikechan.")
+    parser.add_argument("--guild", default=ENV.get("DISCORD_AUTOFREEZE_GUILD_ID") or ENV.get("DISCORD_GUILD_ID"))
+    parser.add_argument("--window-minutes", type=int, default=int(ENV.get("DISCORD_AUTOFREEZE_WINDOW_MINUTES", DEFAULT_WINDOW_MINUTES)))
+    parser.add_argument("--duration", default=ENV.get("DISCORD_AUTOFREEZE_DURATION", DEFAULT_DURATION))
+    parser.add_argument("--limit-per-channel", type=int, default=int(ENV.get("DISCORD_AUTOFREEZE_LIMIT_PER_CHANNEL", DEFAULT_LIMIT_PER_CHANNEL)))
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args()
+
+    if not args.guild:
+        print(json.dumps({"error": "guild is required"}, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    now = dt.datetime.now(dt.timezone.utc)
+    since = iso_utc(now - dt.timedelta(minutes=args.window_minutes))
+    messages, errors, skipped_inaccessible = collect_messages(args.guild, since, args.limit_per_channel)
+    decisions = decide(messages, now)
+    actions = []
+    for decision in decisions:
+        try:
+            actions.append(apply_freeze(args.guild, args.duration, decision, args.dry_run))
+        except Exception as e:
+            failed = {**decision, "status": "error", "error": str(e), "created_at": iso_utc(dt.datetime.now(dt.timezone.utc))}
+            append_decision(failed)
+            actions.append(failed)
+
+    report = {
+        "type": "discord-autofreeze",
+        "guild_id": args.guild,
+        "window_minutes": args.window_minutes,
+        "checked_messages": len(messages),
+        "skipped_inaccessible_channels": skipped_inaccessible,
+        "actions": actions,
+        "errors": errors[:10],
+    }
+    if actions or errors:
+        print(format_report(report))
+    elif not args.quiet:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 1 if any(a.get("status") == "error" for a in actions) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
