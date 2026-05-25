@@ -85,6 +85,51 @@ def _load_env() -> dict[str, str]:
     return env
 
 
+def _auth_access_token(provider: str) -> tuple[str, str | None] | None:
+    for auth_file in (_home() / "auth.json", Path.home() / ".hermes" / "auth.json"):
+        if not auth_file.exists():
+            continue
+        try:
+            data = json.loads(auth_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        credentials = (data.get("credential_pool") or {}).get(provider) or []
+        for credential in credentials:
+            token = credential.get("access_token")
+            if token:
+                return str(token), credential.get("base_url")
+    return None
+
+
+def _aux_llm_config(env: dict[str, str]) -> tuple[str, str, str] | None:
+    """Routing helpers use a small direct chat call, separate from Hermes' main loop."""
+    provider = env.get("NIKECHAN_AUX_LLM_PROVIDER") or env.get("HERMES_INFERENCE_PROVIDER") or ""
+    if provider == "xai-oauth":
+        credential = _auth_access_token("xai-oauth")
+        if not credential:
+            return None
+        token, credential_base_url = credential
+        base_url = (
+            env.get("NIKECHAN_AUX_LLM_BASE_URL")
+            or credential_base_url
+            or env.get("HERMES_INFERENCE_BASE_URL")
+            or "https://api.x.ai/v1"
+        ).rstrip("/")
+        model = env.get("NIKECHAN_AUX_LLM_MODEL") or env.get("HERMES_INFERENCE_MODEL") or "grok-4.3"
+        return token, base_url, model
+
+    api_key = env.get("NIKECHAN_AUX_LLM_API_KEY") or env.get("ALIBABA_CODING_PLAN_API_KEY") or env.get("DASHSCOPE_API_KEY")
+    if not api_key:
+        return None
+    base_url = (
+        env.get("NIKECHAN_AUX_LLM_BASE_URL")
+        or env.get("ALIBABA_CODING_PLAN_BASE_URL")
+        or "https://coding-intl.dashscope.aliyuncs.com/v1"
+    ).rstrip("/")
+    model = env.get("NIKECHAN_AUX_LLM_MODEL") or "qwen3.6-plus"
+    return api_key, base_url, model
+
+
 def _platform_name(event: Any) -> str:
     source = getattr(event, "source", None)
     platform = getattr(source, "platform", "")
@@ -860,11 +905,10 @@ def _llm_should_reply(text: str, event: Any, env: dict[str, str]) -> dict[str, A
     if env.get("NIKECHAN_DISABLE_LLM_SHOULD_REPLY") == "1":
         return None
 
-    api_key = env.get("ALIBABA_CODING_PLAN_API_KEY") or env.get("DASHSCOPE_API_KEY")
-    base_url = (env.get("ALIBABA_CODING_PLAN_BASE_URL") or "https://coding-intl.dashscope.aliyuncs.com/v1").rstrip("/")
-    model = env.get("HERMES_INFERENCE_MODEL") or "qwen3.6-plus"
-    if not api_key:
+    llm_config = _aux_llm_config(env)
+    if not llm_config:
         return None
+    api_key, base_url, model = llm_config
 
     started = time.time()
     source = getattr(event, "source", None)
@@ -1078,11 +1122,10 @@ def _llm_search_plan(text: str, env: dict[str, str]) -> dict[str, Any] | None:
     if env.get("NIKECHAN_ENABLE_LLM_SEARCH_PLAN") != "1":
         return None
 
-    api_key = env.get("ALIBABA_CODING_PLAN_API_KEY") or env.get("DASHSCOPE_API_KEY")
-    base_url = (env.get("ALIBABA_CODING_PLAN_BASE_URL") or "https://coding-intl.dashscope.aliyuncs.com/v1").rstrip("/")
-    model = env.get("HERMES_INFERENCE_MODEL") or "qwen3.6-plus"
-    if not api_key:
+    llm_config = _aux_llm_config(env)
+    if not llm_config:
         return None
+    api_key, base_url, model = llm_config
 
     prompt = (
         "You extract a Discord message search plan from a Japanese user request.\n"
@@ -1137,11 +1180,10 @@ def _llm_reminder_intent(text: str, env: dict[str, str]) -> dict[str, Any] | Non
     if env.get("NIKECHAN_DISABLE_LLM_REMINDER_INTENT") == "1":
         return None
 
-    api_key = env.get("ALIBABA_CODING_PLAN_API_KEY") or env.get("DASHSCOPE_API_KEY")
-    base_url = (env.get("ALIBABA_CODING_PLAN_BASE_URL") or "https://coding-intl.dashscope.aliyuncs.com/v1").rstrip("/")
-    model = env.get("HERMES_INFERENCE_MODEL") or "qwen3.6-plus"
-    if not api_key:
+    llm_config = _aux_llm_config(env)
+    if not llm_config:
         return None
+    api_key, base_url, model = llm_config
 
     prompt = (
         "You classify whether a Japanese Discord message is asking about the Nikechan reminder feature.\n"
@@ -1228,11 +1270,10 @@ def _llm_route_intent(text: str, env: dict[str, str]) -> dict[str, Any] | None:
     if env.get("NIKECHAN_DISABLE_LLM_ROUTE_INTENT") == "1":
         return None
 
-    api_key = env.get("ALIBABA_CODING_PLAN_API_KEY") or env.get("DASHSCOPE_API_KEY")
-    base_url = (env.get("ALIBABA_CODING_PLAN_BASE_URL") or "https://coding-intl.dashscope.aliyuncs.com/v1").rstrip("/")
-    model = env.get("HERMES_INFERENCE_MODEL") or "qwen3.6-plus"
-    if not api_key:
+    llm_config = _aux_llm_config(env)
+    if not llm_config:
         return None
+    api_key, base_url, model = llm_config
 
     prompt = (
         "You classify a Japanese Discord message for AI Nikechan's safe routing layer.\n"
