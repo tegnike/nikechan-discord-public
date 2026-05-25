@@ -1,7 +1,7 @@
 model:
-  default: qwen3.6-plus
-  provider: alibaba-coding-plan
-  base_url: https://coding-intl.dashscope.aliyuncs.com/v1
+  default: grok-4.3
+  provider: xai-oauth
+  base_url: https://api.x.ai/v1
 terminal:
   backend: local
   cwd: /Users/nikenike/.hermes/profiles/nikechan-discord-public/workspace
