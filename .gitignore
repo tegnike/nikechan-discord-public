@@ -1,0 +1,82 @@
+# secrets
+.env
+auth.json
+*.token
+*.key
+*.pem
+
+# runtime state
+state.db*
+sessions/
+logs/
+gateway/
+gateway.pid
+gateway.lock
+gateway_state.json
+auth.lock
+channel_directory.json
+.update_check
+.skills_prompt_snapshot.json
+.no-bundled-skills
+.clean_shutdown
+
+# caches / generated files
+cache/
+audio_cache/
+image_cache/
+pairing/
+plans/
+sandboxes/
+skins/
+home/
+hooks/
+workspace/
+local/
+__pycache__/
+*.pyc
+.DS_Store
+
+# profile-local runtime binary
+bin/tirith
+
+# cron runtime lock
+cron/.tick.lock
+
+# cron execution artifacts
+cron/output/
+
+# Hermes bundled skills copied into the profile by the runtime. Custom flat skills remain tracked.
+skills/.hub/
+skills/apple/
+skills/autonomous-ai-agents/
+skills/creative/
+skills/data-science/
+skills/devops/
+skills/diagramming/
+skills/dogfood/
+skills/domain/
+skills/email/
+skills/gaming/
+skills/gifs/
+skills/github/
+skills/inference-sh/
+skills/mcp/
+skills/media/
+skills/mlops/
+skills/note-taking/
+skills/productivity/
+skills/red-teaming/
+skills/research/
+skills/smart-home/
+skills/social-media/
+skills/software-development/
+skills/yuanbao/
+
+# Hermes skill runtime metadata
+skills/.bundled_manifest
+skills/.curator_state
+skills/.usage.json
+skills/.usage.json.lock
+
+# Hermes mutates this on every cron tick; keep schedule source in cron/jobs.template.json
+cron/jobs.json

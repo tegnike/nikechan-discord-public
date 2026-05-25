@@ -1,0 +1,6 @@
+name: nikechan-discord-routing
+version: 0.1.0
+description: "Route natural-language Discord summary requests to the guarded Discord history helper before LLM dispatch."
+author: "AI Nikechan"
+hooks:
+  - pre_gateway_dispatch
