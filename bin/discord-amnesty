@@ -44,9 +44,6 @@ def load_env() -> dict:
     profile = env.get("HERMES_PROFILE") or env.get("HERMES_PROFILE_NAME")
     if profile:
         candidates.append(home / "profiles" / profile / ".env")
-    candidates.extend([
-        home / "profiles" / "nikechandiscord" / ".env",
-    ])
     for path in candidates:
         if not path.exists():
             continue

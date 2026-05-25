@@ -746,7 +746,7 @@ def _discord_reaction_rest(event: Any, emoji: str, *, remove: bool = False) -> N
         method=method,
         headers={
             "Authorization": f"Bot {token}",
-            "User-Agent": "nikechan-hermes-runtime",
+            "User-Agent": "nikechan-discord-public",
         },
     )
     try:

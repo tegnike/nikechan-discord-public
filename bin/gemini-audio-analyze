@@ -32,7 +32,6 @@ def load_env() -> dict:
     home = Path.home() / ".hermes"
     candidates.extend([
         home / ".env",
-        home / "profiles" / "nikechandiscord" / ".env",
     ])
     for path in candidates:
         if not path.exists():

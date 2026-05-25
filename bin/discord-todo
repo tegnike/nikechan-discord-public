@@ -21,10 +21,7 @@ def load_env() -> dict[str, str]:
     candidates = []
     if env.get("HERMES_HOME"):
         candidates.append(Path(env["HERMES_HOME"]) / ".env")
-        candidates.append(Path(env["HERMES_HOME"]) / "profiles" / "nikechandiscord" / ".env")
     candidates.append(Path.home() / ".hermes" / ".env")
-    candidates.append(Path.home() / ".hermes" / "profiles" / "nikechandiscord" / ".env")
-    candidates.append(Path.home() / "WorkSpace" / "nikechan-hermes-runtime" / "profiles" / "nikechandiscord" / ".env")
     candidates.append(Path.home() / "WorkSpace" / "nikechan" / ".env")
     extra = env.get("NIKECHAN_ENV_FILES") or env.get("NIKECHAN_DB_ENV_FILES")
     if extra:

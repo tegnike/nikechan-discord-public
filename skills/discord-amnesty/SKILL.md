@@ -56,7 +56,7 @@ Use the managed helper. Prefer mentioning the target user or providing the user 
   --apply
 ```
 
-The helper writes audit logs under `~/.hermes/local/discord-amnesty/audit.jsonl`.
+The helper writes audit logs under the profile-local `local/discord-amnesty/audit.jsonl`.
 
 ## Output
 

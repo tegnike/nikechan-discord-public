@@ -13,8 +13,9 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
-HISTORY = "/Users/nikenike/.hermes/bin/discord-history"
-FREEZE = "/Users/nikenike/.hermes/bin/discord-freeze"
+BIN_DIR = Path(__file__).resolve().parent
+HISTORY = str(BIN_DIR / "discord-history")
+FREEZE = str(BIN_DIR / "discord-freeze")
 DEFAULT_WINDOW_MINUTES = 5
 DEFAULT_DURATION = "12h"
 DEFAULT_LIMIT_PER_CHANNEL = 80
