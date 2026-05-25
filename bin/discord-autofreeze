@@ -65,6 +65,7 @@ ENV = load_env()
 HOME = Path(ENV.get("HERMES_HOME") or Path.home() / ".hermes")
 STATE_DIR = HOME / "local" / "discord-autofreeze"
 DECISIONS = STATE_DIR / "decisions.jsonl"
+ERRORS = STATE_DIR / "errors.jsonl"
 
 
 def iso_utc(value: dt.datetime) -> str:
@@ -77,6 +78,34 @@ def run_json(args: list[str], timeout: int = 45) -> dict:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"{' '.join(args[:2])} failed: {detail}")
     return json.loads(proc.stdout)
+
+
+def sanitize_error(detail: str) -> str:
+    text = detail.strip()
+    if "Missing Access" in text or '"code": 50001' in text:
+        return "権限なしのため取得スキップ"
+    if "network timeout" in text or "timed out" in text or "TimeoutError" in text:
+        return "Discord API取得タイムアウト"
+    if "429" in text or "retry limit" in text:
+        return "Discord API rate limit"
+    if "DISCORD_BOT_TOKEN" in text:
+        return "Discord Bot token未設定"
+    if "Discord API" in text:
+        return text.splitlines()[0][:160]
+    return "Discord履歴取得エラー"
+
+
+def append_error(channel: dict | None, detail: str) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "created_at": iso_utc(dt.datetime.now(dt.timezone.utc)),
+        "channel_id": (channel or {}).get("id"),
+        "channel_name": (channel or {}).get("name"),
+        "summary": sanitize_error(detail),
+        "detail": detail[-4000:],
+    }
+    with ERRORS.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def normalized_content(message: dict) -> str:
@@ -196,7 +225,8 @@ def collect_messages(guild: str, since: str, limit: int) -> tuple[list[dict], li
             if "Missing Access" in detail or '"code": 50001' in detail:
                 skipped_inaccessible += 1
             else:
-                errors.append(f"{channel.get('name') or channel_id}: {detail}")
+                append_error(channel, detail)
+                errors.append(f"{channel.get('name') or channel_id}: {sanitize_error(detail)}")
             continue
         for msg in data.get("messages", []):
             author = msg.get("author") or {}
@@ -342,9 +372,7 @@ def format_report(report: dict) -> str:
                 lines.append(f"解除時間: 実行失敗")
                 lines.append(f"エラー: {action.get('error')}")
     if errors:
-        lines.append("取得エラーがありました。")
-        for error in errors[:3]:
-            lines.append(f"- {error}")
+        lines.append(f"補足: 一部チャンネルで取得エラーがありました（{len(errors)}件）。詳細は管理側ログに記録済みです。")
     return "\n".join(lines)
 
 
@@ -384,8 +412,12 @@ def main():
         "actions": actions,
         "errors": errors[:10],
     }
-    if actions or errors:
+    if actions:
         print(format_report(report))
+    elif errors:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with ERRORS.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({**report, "created_at": iso_utc(now)}, ensure_ascii=False) + "\n")
     elif not args.quiet:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     return 1 if any(a.get("status") == "error" for a in actions) else 0

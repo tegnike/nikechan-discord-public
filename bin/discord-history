@@ -108,6 +108,11 @@ def request(method: str, path: str, params: dict | None = None, body: dict | Non
                 time.sleep(max(0.25, min(retry_after, 5.0)) + 0.1)
                 continue
             raise DiscordError(f"Discord API {e.code}: {body_text}") from e
+        except (TimeoutError, urllib.error.URLError, OSError) as e:
+            if attempt < 5:
+                time.sleep(0.5 + attempt * 0.5)
+                continue
+            raise DiscordError(f"Discord API network timeout: {type(e).__name__}: {e}") from e
     raise DiscordError("Discord API 429 retry limit exceeded")
 
 
