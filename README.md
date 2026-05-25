@@ -31,13 +31,3 @@ AIニケちゃん公開Discord常駐Botの Hermes profile です。
 
 `cron/jobs.json` はHermesが実行回数や次回実行時刻を毎分更新するため、Git管理しません。cron定義を変更した場合は `cron/jobs.template.json` にも反映してください。
 
-## runtime wiring
-
-このprofileはlive profileそのものなので、設定・スキル・scripts・binをliveへsymlinkする必要はありません。
-
-LaunchDaemonを再作成する場合だけ次を実行します。
-
-```bash
-./scripts/install-launchdaemon.sh
-```
-
