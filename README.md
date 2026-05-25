@@ -41,4 +41,3 @@ LaunchDaemonを再作成する場合だけ次を実行します。
 ./scripts/install-launchdaemon.sh
 ```
 
-旧 `~/WorkSpace/nikechan-hermes-runtime` は不要です。
