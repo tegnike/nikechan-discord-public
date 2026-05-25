@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.hermes.gateway-nikechan-discord-public</string>
+  <key>Comment</key>
+  <string>Hermes Agent Gateway (nikechan-discord-public)</string>
+  <key>UserName</key>
+  <string>nikenike</string>
+  <key>GroupName</key>
+  <string>staff</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/nikenike/.hermes/hermes-agent/venv/bin/python</string>
+    <string>-m</string>
+    <string>hermes_cli.main</string>
+    <string>--profile</string>
+    <string>nikechan-discord-public</string>
+    <string>gateway</string>
+    <string>run</string>
+    <string>--replace</string>
+    <string>--accept-hooks</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/nikenike/.hermes/hermes-agent</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/nikenike</string>
+    <key>HERMES_HOME</key>
+    <string>/Users/nikenike/.hermes/profiles/nikechan-discord-public</string>
+    <key>PATH</key>
+    <string>/Users/nikenike/.hermes/hermes-agent/venv/bin:/Users/nikenike/.hermes/hermes-agent/node_modules/.bin:/Users/nikenike/.local/bin:/usr/local/node/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>VIRTUAL_ENV</key>
+    <string>/Users/nikenike/.hermes/hermes-agent/venv</string>
+    <key>HERMES_ACCEPT_HOOKS</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/nikenike/.hermes/profiles/nikechan-discord-public/logs/gateway.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/nikenike/.hermes/profiles/nikechan-discord-public/logs/gateway.error.log</string>
+</dict>
+</plist>

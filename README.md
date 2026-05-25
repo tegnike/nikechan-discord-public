@@ -17,6 +17,7 @@ AIニケちゃん公開Discord常駐Botの Hermes profile です。
 - `skills/` 配下のニケちゃん独自skill
 - `scripts/`
 - `bin/` 配下のDiscord/音楽解析/モデレーション補助CLI
+- `launchd/` のLaunchDaemon定義
 - `plugins/`
 - `cron/jobs.template.json`
 
@@ -35,5 +36,12 @@ AIニケちゃん公開Discord常駐Botの Hermes profile です。
 profile外から呼ばれる補助CLIは `~/.hermes/bin/*` からこのrepoの `bin/*` へsymlinkします。
 
 `~/.hermes/scripts` はこのrepoの `scripts/` へsymlinkします。
+
+再作成する場合は次を実行します。
+
+```bash
+./scripts/install-runtime-links.sh
+./scripts/install-launchdaemon.sh
+```
 
 旧 `~/WorkSpace/nikechan-hermes-runtime` は不要です。
