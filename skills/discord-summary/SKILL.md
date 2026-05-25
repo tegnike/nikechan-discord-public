@@ -51,7 +51,7 @@ Do not create cron jobs, delete messages, timeout users, change roles, or perfor
    - For "yesterday/today", interpret in the profile timezone.
 2. Fetch messages with:
    ```bash
-   /Users/nikenike/.hermes/bin/discord-history fetch --channel CHANNEL_ID_OR_NAME --from ISO --to ISO --limit 500
+   /Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/discord-history fetch --channel CHANNEL_ID_OR_NAME --from ISO --to ISO --limit 500
    ```
    Omit `--from`/`--to` when not specified. Use `--guild GUILD_ID` for the current server when available.
 3. If the command returns too many messages or empty content, explain the limitation and ask for a narrower range.
@@ -75,5 +75,5 @@ Avoid empty headings. For example, do not output "決定事項なし / TODOな�
 
 ## Pitfalls
 
-- **discord-history command not found**: Use the absolute path `/Users/nikenike/.hermes/bin/discord-history`. If it does not exist, do NOT retry the same command in a loop. Tell the user the command is not installed and stop.
+- **discord-history command not found**: Use the absolute path `/Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/discord-history`. If it does not exist, do NOT retry the same command in a loop. Tell the user the command is not installed and stop.
 - **Gateway context missing**: If you cannot resolve the current channel ID from gateway context, ask the user to specify the channel explicitly rather than guessing.

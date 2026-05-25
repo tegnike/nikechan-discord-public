@@ -28,7 +28,7 @@ Use this skill when the user asks for a reminder or scheduled fixed Discord noti
 
 - 通常のDiscord応答からHermes cron、terminal、file toolは使わない。
 - リマインダーの作成・一覧・削除・削除確認の意図分類はLLMを優先し、LLM失敗時だけ保守的な正規表現へフォールバックする。
-- ルーティングプラグインが `~/.hermes/bin/discord-reminder` の `create` / `list` / `cancel` だけを呼び、ローカル状態を管理する。
+- ルーティングプラグインが `/Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/discord-reminder` の `create` / `list` / `cancel` だけを呼び、ローカル状態を管理する。
 - 配信は1分ごとの `discord-reminder-dispatcher` no-agent cronが行う。
 - 各リマインダーはHermes cronジョブとして増やさない。
 - 通知先は、明示された `<#channel>` または依頼元チャンネル。

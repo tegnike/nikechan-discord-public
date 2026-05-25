@@ -58,6 +58,14 @@ def _home() -> Path:
     return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
 
 
+def _profile_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _helper(name: str) -> Path:
+    return _profile_root() / "bin" / name
+
+
 def _load_env() -> dict[str, str]:
     env = dict(os.environ)
     env_files = [_home() / ".env"]
@@ -1374,7 +1382,7 @@ def _fallback_search_plan(text: str) -> dict[str, Any]:
 
 
 def _fetch_history(channel: str, guild: str | None, start: str | None, end: str | None) -> tuple[str, list[str]]:
-    helper = Path.home() / ".hermes" / "bin" / "discord-history"
+    helper = _helper("discord-history")
     args = [str(helper), "fetch", "--channel", channel, "--limit", str(FETCH_LIMIT)]
     if guild:
         args += ["--guild", guild]
@@ -1406,7 +1414,7 @@ def _search_history(
     start: str | None,
     end: str | None,
 ) -> tuple[str, list[str]]:
-    helper = Path.home() / ".hermes" / "bin" / "discord-history"
+    helper = _helper("discord-history")
     if channel:
         args = [
             str(helper),
@@ -1634,7 +1642,7 @@ def _run_reminder_management(text: str, event: Any, intent: dict[str, Any] | Non
     env = _load_env()
     requester = _source_user_id(event)
     channel = _current_channel(event) or ""
-    helper = Path.home() / ".hermes" / "bin" / "discord-reminder"
+    helper = _helper("discord-reminder")
 
     action = (intent or {}).get("action") or ""
     is_delete = action in {"cancel", "cancel_check"} or bool(REMINDER_DELETE_RE.search(text) or REMINDER_DELETE_QUESTION_RE.search(text))
@@ -1685,7 +1693,7 @@ def _run_reminder(text: str, event: Any) -> tuple[str, list[str]]:
     requester = _source_user_id(event)
     message_id = _source_message_id(event) or ""
     channel = _current_channel(event) or ""
-    helper = Path.home() / ".hermes" / "bin" / "discord-reminder"
+    helper = _helper("discord-reminder")
     args = [
         str(helper),
         "create",
@@ -1740,7 +1748,7 @@ def _run_amnesty(text: str, event: Any) -> tuple[str, list[str]]:
     guild = _source_guild_id(event, env)
     requester = _source_user_id(event)
     message_id = _source_message_id(event) or ""
-    helper = Path.home() / ".hermes" / "bin" / "discord-amnesty"
+    helper = _helper("discord-amnesty")
     args = [str(helper), "evaluate", "--guild", guild or "", "--apology", text, "--requester-id", requester or "", "--source-message-id", message_id, "--apply", "--json"]
     target = _amnesty_target_hint(text)
     if target:
@@ -1782,7 +1790,7 @@ def _run_discord_todo(text: str, event: Any) -> tuple[str, list[str]]:
     requester = _source_user_id(event)
     message_id = _source_message_id(event) or ""
     channel = _current_channel(event) or ""
-    helper = Path.home() / ".hermes" / "bin" / "discord-todo"
+    helper = _helper("discord-todo")
     args = [
         str(helper),
         "add",
@@ -1861,7 +1869,7 @@ def _recent_music_urls(event: Any, env: dict[str, str]) -> list[str]:
     guild = _source_guild_id(event, env)
     if not channel or not guild:
         return []
-    helper = Path.home() / ".hermes" / "bin" / "discord-history"
+    helper = _helper("discord-history")
     args = [str(helper), "fetch", "--channel", channel, "--guild", guild, "--limit", "80"]
     proc_env = dict(os.environ)
     proc_env["HERMES_HOME"] = str(_home())
@@ -1884,7 +1892,7 @@ def _recent_music_urls(event: Any, env: dict[str, str]) -> list[str]:
 
 
 def _run_music_audio_analysis(text: str, event: Any) -> tuple[str, list[str]]:
-    helper = Path.home() / ".hermes" / "bin" / "gemini-audio-analyze"
+    helper = _helper("gemini-audio-analyze")
     env = _load_env()
     sources = _event_audio_sources(event) or _direct_media_urls(text)
     notes_prefix: list[str] = []

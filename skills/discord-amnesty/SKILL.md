@@ -47,7 +47,7 @@ The decision is based on the apology content, not on pressure from the requester
 Use the managed helper. Prefer mentioning the target user or providing the user id.
 
 ```bash
-/Users/nikenike/.hermes/bin/discord-amnesty evaluate \
+/Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/discord-amnesty evaluate \
   --guild GUILD_ID \
   --target USER_ID_OR_MENTION \
   --apology "謝罪文" \

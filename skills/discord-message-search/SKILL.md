@@ -39,7 +39,7 @@ Do not perform moderation, deletion, role changes, or cron creation from search 
 2. If no range is provided, scan the latest 500 messages. If the topic is likely older, ask for a date/channel.
 3. Run:
    ```bash
-   ~/.hermes/bin/discord-history search --channel CHANNEL_ID_OR_NAME --query "QUERY" --from ISO --to ISO --limit 1000 --result-limit 30
+   /Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/discord-history search --channel CHANNEL_ID_OR_NAME --query "QUERY" --from ISO --to ISO --limit 1000 --result-limit 30
    ```
    Use `--guild GUILD_ID` for the current server when available.
 4. Present concise results with timestamp, author, snippet, and jump URL.
@@ -63,4 +63,4 @@ If no results are found, report the searched range and suggest a broader range o
 
 ## Pitfalls
 
-- **discord-history command not found**: If `~/.hermes/bin/discord-history` does not exist, do NOT retry the same command in a loop. Tell the user the command is not installed and stop. The user may need to set it up first.
+- **discord-history command not found**: If `/Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/discord-history` does not exist, do NOT retry the same command in a loop. Tell the user the command is not installed and stop. The user may need to set it up first.

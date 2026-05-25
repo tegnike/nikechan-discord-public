@@ -46,11 +46,11 @@ If someone asks to freeze/timeout another user, refuse briefly and say moderatio
    - unsolicited external-contact business solicitation
 4. For each action, it calls prepare:
    ```bash
-   ~/.hermes/bin/discord-freeze prepare --guild GUILD_ID --user-id USER_ID --duration 30m --reason "reason" --executor-id EXECUTOR_ID --source-message-id MESSAGE_ID
+   /Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/discord-freeze prepare --guild GUILD_ID --user-id USER_ID --duration 30m --reason "reason" --executor-id EXECUTOR_ID --source-message-id MESSAGE_ID
    ```
 5. Then it applies internally without accepting any Discord-user approval:
    ```bash
-   ~/.hermes/bin/discord-freeze apply --action-id ACTION_ID --approval-message-id MESSAGE_ID
+   /Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/discord-freeze apply --action-id ACTION_ID --approval-message-id MESSAGE_ID
    ```
 6. Audit files are written under `local/discord-freeze` and `local/discord-autofreeze`.
 

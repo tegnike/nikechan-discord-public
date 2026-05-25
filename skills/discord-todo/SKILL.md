@@ -41,7 +41,7 @@ Do not use this skill for:
 Use the managed helper:
 
 ```bash
-/Users/nikenike/.hermes/bin/discord-todo add \
+/Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/discord-todo add \
   --text "元のDiscordメッセージ" \
   --guild GUILD_ID \
   --channel CHANNEL_ID \

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export HERMES_HOME="${HERMES_HOME:-/Users/nikenike/.hermes/profiles/nikechan-discord-public}"
-/Users/nikenike/.hermes/bin/discord-reminder dispatch
+PROFILE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export HERMES_HOME="${HERMES_HOME:-$PROFILE_DIR}"
+
+"$PROFILE_DIR/bin/discord-reminder" dispatch

@@ -38,25 +38,25 @@ Do not fetch arbitrary webpages looking for media unless the user explicitly ask
 Use the managed helper:
 
 ```bash
-/Users/nikenike/.hermes/bin/gemini-audio-analyze analyze --file AUDIO_PATH --mode music
+/Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/gemini-audio-analyze analyze --file AUDIO_PATH --mode music
 ```
 
 For speech-heavy audio:
 
 ```bash
-/Users/nikenike/.hermes/bin/gemini-audio-analyze analyze --file AUDIO_PATH --mode speech
+/Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/gemini-audio-analyze analyze --file AUDIO_PATH --mode speech
 ```
 
 For a Suno共有URL or direct media URL:
 
 ```bash
-/Users/nikenike/.hermes/bin/gemini-audio-analyze analyze --url MEDIA_URL --mode music
+/Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/gemini-audio-analyze analyze --url MEDIA_URL --mode music
 ```
 
 Optional custom prompt:
 
 ```bash
-/Users/nikenike/.hermes/bin/gemini-audio-analyze analyze --file AUDIO_PATH --mode music --prompt "重点的にリズムと歌詞テーマを見て"
+/Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/gemini-audio-analyze analyze --file AUDIO_PATH --mode music --prompt "重点的にリズムと歌詞テーマを見て"
 ```
 
 The helper reads `GEMINI_API_KEY` or `GOOGLE_API_KEY` from the environment/profile `.env` and uses `gemini-3.5-flash` by default.
