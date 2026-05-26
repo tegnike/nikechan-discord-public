@@ -241,6 +241,7 @@ delegation:
 display:
   compact: false
   tool_progress: verbose
+  tool_progress_command: true
   cleanup_progress: false
   interim_assistant_messages: true
   busy_input_mode: queue

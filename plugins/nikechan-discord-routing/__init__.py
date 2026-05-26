@@ -2154,6 +2154,13 @@ def register(ctx):
             return None
         if "discord" not in _platform_name(event):
             return None
+        text = getattr(event, "text", "") or ""
+        if isinstance(text, str) and text.lstrip().startswith("/"):
+            # Slash commands must stay at the beginning of the message so the
+            # Hermes gateway command dispatcher can recognize them. Adding
+            # Discord/person context here turns commands like /reset into
+            # ordinary user text.
+            return None
         if _config_bool("should_reply", False):
             _discord_reaction_rest(event, "👀")
             decision = _should_reply(event)
@@ -2174,7 +2181,6 @@ def register(ctx):
             routed["text"] = _with_person_context(routed["text"], event)
             _remember_recent_message(event)
             return routed
-        text = getattr(event, "text", "") or ""
         if isinstance(text, str):
             contextualized = _with_person_context(text, event)
             if contextualized != text:
