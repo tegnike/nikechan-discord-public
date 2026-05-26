@@ -243,7 +243,7 @@ delegation:
   max_iterations: 50
 display:
   compact: false
-  tool_progress: off
+  tool_progress: all
   cleanup_progress: false
   interim_assistant_messages: true
   busy_input_mode: queue
