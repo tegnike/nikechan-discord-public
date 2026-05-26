@@ -314,10 +314,24 @@ def fetch_messages(channel: str, guild_id: str | None, start: dt.datetime | None
     return {"channel": ch, "from": iso(start) if start else None, "to": iso(end) if end else None, "count": len(out), "messages": out}
 
 
+def fetch_message(channel: str, message_id: str, guild_id: str | None):
+    ch = resolve_channel(channel, guild_id)
+    channel_id = ch["id"]
+    msg = request("GET", f"/channels/{channel_id}/messages/{message_id}")
+    return {
+        "channel": ch,
+        "message": normalize_message(msg, ch.get("guild_id"), channel_id),
+    }
+
+
 def cmd_fetch(args):
     start = parse_time(args.from_time)
     end = parse_time(args.to_time)
     print(json.dumps(fetch_messages(args.channel, args.guild, start, end, args.limit), ensure_ascii=False, indent=2))
+
+
+def cmd_fetch_message(args):
+    print(json.dumps(fetch_message(args.channel, args.message, args.guild), ensure_ascii=False, indent=2))
 
 
 def cmd_search(args):
@@ -448,10 +462,16 @@ def main():
     p.add_argument("--result-limit", type=int, default=30)
     p = sub.add_parser("list-channels")
     p.add_argument("--guild", required=True, help="Guild id to list. Must be in DISCORD_ALLOWED_GUILDS.")
+    p = sub.add_parser("fetch-message")
+    p.add_argument("--channel", required=True, help="Channel id or <#id>")
+    p.add_argument("--message", required=True, help="Message id")
+    p.add_argument("--guild", help="Guild id; must be in DISCORD_ALLOWED_GUILDS if configured")
     args = parser.parse_args()
     try:
         if args.cmd == "fetch":
             cmd_fetch(args)
+        elif args.cmd == "fetch-message":
+            cmd_fetch_message(args)
         elif args.cmd == "search":
             cmd_search(args)
         elif args.cmd == "search-guild":
