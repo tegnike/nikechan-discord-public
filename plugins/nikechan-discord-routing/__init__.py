@@ -25,10 +25,11 @@ SUMMARY_RE = re.compile(r"(要約|まとめ|どんな話|何があった|内容|
 DISCORD_CONTEXT_RE = re.compile(r"(Discord|ディスコ|チャンネル|<#\d+>|#\S+)")
 TIME_CONTEXT_RE = re.compile(r"(ここ|直近|過去|今日|昨日|数時間|履歴|会話|ログ)")
 DISCORD_HISTORY_CONTEXT_RE = re.compile(
-    r"(履歴|ログ|会話|経緯|この(?:チャンネル|サーバー|鯖)|チャンネル内|サーバー内|前に|以前|さっき|"
+    r"(履歴|ログ|会話|経緯|この(?:チャンネル|サーバー|鯖)|チャンネル内|サーバー内|前に|以前|"
     r"いつ.*話|誰.*話|誰が.*言|どこで.*話|ログ探|履歴探)"
 )
 SEARCH_RE = re.compile(r"(調べて|調査|探して|検索|ログ探|履歴探|経緯|いつ.*話|誰.*話|前に.*話|以前.*話)")
+DISCORD_CONTEXT_BLOCK_RE = re.compile(r"\[DISCORD_[A-Z_]+_CONTEXT\].*?\[/DISCORD_[A-Z_]+_CONTEXT\]\s*", re.S)
 MUSIC_AUDIO_RE = re.compile(r"(楽曲(?:解析|分析|取得)|音楽解析|音声解析|内容理解|この曲|曲.*(?:解析|分析|調べ)|音声.*(?:解析|分析|要約|まとめ|文字起こし)|歌詞|ボーカル|曲調|ジャンル|テンポ|suno|mp3|wav|m4a|flac|ogg|aac)", re.IGNORECASE)
 SUNO_URL_RE = re.compile(r"https?://(?:www\.)?suno\.com/song/[0-9a-fA-F-]{32,36}(?:[/?#][^\s<>\"]*)?", re.IGNORECASE)
 DIRECT_MEDIA_URL_RE = re.compile(r"https?://[^\s<>\"]+\.(?:mp3|wav|m4a|flac|ogg|aac|mp4|webm)(?:\?[^\s<>\"]*)?", re.IGNORECASE)
@@ -56,6 +57,11 @@ _PERSON_CONTEXT_CACHE: dict[str, tuple[float, str | None]] = {}
 _RECENT_DISCORD_MESSAGES: dict[str, list[dict[str, str]]] = {}
 
 PERSON_LOOKUP_RE = re.compile(r"(DB|データベース|ユーザ(?:ー)?記憶|人物|あだ名|ニックネーム|呼び方|誰|だれ)")
+
+
+def _visible_user_text(text: str) -> str:
+    cleaned = DISCORD_CONTEXT_BLOCK_RE.sub("", text)
+    return cleaned.strip() or text
 
 
 def _home() -> Path:
@@ -1382,6 +1388,7 @@ def _looks_like_route_llm_candidate(text: str) -> bool:
 
 
 def _route_intent(text: str) -> dict[str, Any]:
+    text = _visible_user_text(text)
     cached = _ROUTE_INTENT_CACHE.get(text)
     if cached:
         return cached
@@ -2008,6 +2015,7 @@ def _rewrite(event: Any) -> dict[str, str] | None:
     text = getattr(event, "text", "") or ""
     if not isinstance(text, str):
         return None
+    text = _visible_user_text(text)
 
     for handler in (_rewrite_youtube, _rewrite_arxiv):
         routed = handler(text)
