@@ -858,6 +858,48 @@ def _is_reply_event(event: Any) -> bool:
     )
 
 
+def _reply_target_is_bot(event: Any) -> bool:
+    raw = getattr(event, "raw_message", None)
+    reference = getattr(raw, "reference", None)
+    resolved = getattr(reference, "resolved", None)
+    author = getattr(resolved, "author", None)
+    if author is None:
+        return False
+    state_user = getattr(getattr(raw, "_state", None), "user", None)
+    if state_user is not None:
+        return author == state_user
+    return bool(getattr(author, "bot", False))
+
+
+def _reply_target_is_other_user(event: Any) -> bool:
+    if not _is_reply_event(event):
+        return False
+    raw = getattr(event, "raw_message", None)
+    reference = getattr(raw, "reference", None)
+    resolved = getattr(reference, "resolved", None)
+    author = getattr(resolved, "author", None)
+    source = getattr(event, "source", None)
+    sender_id = str(getattr(source, "user_id", "") or "")
+    if author is None:
+        reply_id = str(
+            getattr(event, "reply_to_message_id", None)
+            or getattr(source, "reply_to_message_id", None)
+            or ""
+        )
+        if reply_id:
+            for row in _RECENT_DISCORD_MESSAGES.get(_current_channel(event) or "", []):
+                if row.get("message_id") == reply_id:
+                    target_user_id = str(row.get("user_id") or "")
+                    return bool(target_user_id and target_user_id != sender_id)
+        return False
+    if _reply_target_is_bot(event):
+        return False
+    author_id = str(getattr(author, "id", "") or "")
+    if sender_id and author_id and sender_id == author_id:
+        return False
+    return True
+
+
 def _is_free_response_channel(event: Any) -> bool:
     channel = _current_channel(event)
     if not channel:
@@ -939,7 +981,7 @@ def _llm_should_reply(text: str, event: Any, env: dict[str, str]) -> dict[str, A
         "a human-to-human side conversation, or a standalone message.\n"
         "Default stance in free_response mode: reply true unless there is a clear reason not to.\n"
         "Reply true when:\n"
-        "- the message is addressed to Nikechan by name, mention, or reply\n"
+        "- the message is addressed to Nikechan by name, mention, or reply to Nikechan's own bot message\n"
         "- it is a direct question, request, instruction, or asks for help/status/capability\n"
         "- it asks for Discord summary/search, music/audio analysis, reminders, or amnesty handling\n"
         "- it is a clear follow-up that expects the bot to continue the current exchange\n"
@@ -948,6 +990,7 @@ def _llm_should_reply(text: str, event: Any, env: dict[str, str]) -> dict[str, A
         "- in free_response mode, short feedback about Nikechan's behavior should usually be true, such as 'なんかキモいな', '無視されてて草', 'URL読めるようになったんだね', or 'あっはいすみません・・・'\n"
         "- in free_response mode, short conversational continuations should usually be true, such as 'ありがとう', 'あー、なるほどね', 'はろー', 'ブヒヒッ', or '日本語のモールスだよ？'\n"
         "Reply false when:\n"
+        "- it is a Discord reply to another human's message, not to Nikechan\n"
         "- it is clearly conversation between humans and not involving Nikechan\n"
         "- it is clearly a private aside, monologue, or side comment where no response is expected\n"
         "- it is only a bare test marker like exactly 'test' or 'テスト' with no request\n"
@@ -1017,7 +1060,9 @@ def _fallback_should_reply(text: str, event: Any) -> dict[str, Any]:
     route = _ROUTE_INTENT_CACHE.get(text) or _fallback_route_intent(text)
     if route.get("action") != "none":
         return {"reply": True, "confidence": 0.9, "reason": "managed route intent", "source": "fallback"}
-    if _bot_was_mentioned(event) or _is_reply_event(event) or _looks_addressed_to_nikechan(text):
+    if _reply_target_is_other_user(event):
+        return {"reply": False, "confidence": 0.95, "reason": "reply to another user", "source": "fallback"}
+    if _bot_was_mentioned(event) or _reply_target_is_bot(event) or _looks_addressed_to_nikechan(text):
         return {"reply": True, "confidence": 0.85, "reason": "addressed to bot", "source": "fallback"}
     if _looks_like_url_content_request(text, event):
         return {"reply": True, "confidence": 0.9, "reason": "url content request", "source": "fallback"}
@@ -1048,10 +1093,12 @@ def _should_reply(event: Any) -> dict[str, Any]:
         return {"reply": False, "confidence": 1.0, "reason": "bare test marker", "source": "local"}
     if text.startswith("/"):
         return {"reply": True, "confidence": 1.0, "reason": "command", "source": "local"}
+    if _reply_target_is_other_user(event):
+        return {"reply": False, "confidence": 1.0, "reason": "reply to another user", "source": "local"}
     route = _ROUTE_INTENT_CACHE.get(text) or _fallback_route_intent(text)
     if route.get("action") != "none":
         return {"reply": True, "confidence": 1.0, "reason": f"managed route: {route.get('action')}", "source": "local"}
-    if _bot_was_mentioned(event) or _is_reply_event(event) or _looks_addressed_to_nikechan(text):
+    if _bot_was_mentioned(event) or _reply_target_is_bot(event) or _looks_addressed_to_nikechan(text):
         return {"reply": True, "confidence": 1.0, "reason": "addressed to bot", "source": "local"}
     if _looks_like_url_content_request(text, event):
         return {"reply": True, "confidence": 1.0, "reason": "url content request", "source": "local"}
