@@ -211,7 +211,6 @@ platform_toolsets:
   telegram:
   - hermes-telegram
   discord:
-  - browser
   - web
   - search
   whatsapp:
