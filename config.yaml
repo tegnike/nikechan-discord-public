@@ -153,7 +153,6 @@ agent:
   - delegation
   - messaging
   - todo
-  - safe
   - image_gen
   - vision
   - video
@@ -212,7 +211,6 @@ platform_toolsets:
   - hermes-telegram
   discord:
   - web
-  - search
   whatsapp:
   - hermes-whatsapp
   slack:
