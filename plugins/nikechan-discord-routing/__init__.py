@@ -24,7 +24,11 @@ except Exception:  # pragma: no cover
 SUMMARY_RE = re.compile(r"(要約|まとめ|どんな話|何があった|内容|流れ|振り返)")
 DISCORD_CONTEXT_RE = re.compile(r"(Discord|ディスコ|チャンネル|<#\d+>|#\S+)")
 TIME_CONTEXT_RE = re.compile(r"(ここ|直近|過去|今日|昨日|数時間|履歴|会話|ログ)")
-SEARCH_RE = re.compile(r"(調べて|調査|探して|検索|ログ探|履歴探|経緯|いつ.*話|誰.*話)")
+DISCORD_HISTORY_CONTEXT_RE = re.compile(
+    r"(履歴|ログ|会話|経緯|この(?:チャンネル|サーバー|鯖)|チャンネル内|サーバー内|前に|以前|さっき|"
+    r"いつ.*話|誰.*話|誰が.*言|どこで.*話|ログ探|履歴探)"
+)
+SEARCH_RE = re.compile(r"(調べて|調査|探して|検索|ログ探|履歴探|経緯|いつ.*話|誰.*話|前に.*話|以前.*話)")
 MUSIC_AUDIO_RE = re.compile(r"(楽曲(?:解析|分析|取得)|音楽解析|音声解析|内容理解|この曲|曲.*(?:解析|分析|調べ)|音声.*(?:解析|分析|要約|まとめ|文字起こし)|歌詞|ボーカル|曲調|ジャンル|テンポ|suno|mp3|wav|m4a|flac|ogg|aac)", re.IGNORECASE)
 SUNO_URL_RE = re.compile(r"https?://(?:www\.)?suno\.com/song/[0-9a-fA-F-]{32,36}(?:[/?#][^\s<>\"]*)?", re.IGNORECASE)
 DIRECT_MEDIA_URL_RE = re.compile(r"https?://[^\s<>\"]+\.(?:mp3|wav|m4a|flac|ogg|aac|mp4|webm)(?:\?[^\s<>\"]*)?", re.IGNORECASE)
@@ -257,7 +261,9 @@ def _looks_like_search_request(text: str) -> bool:
         return False
     if _looks_like_music_audio_request(text):
         return False
-    return bool(SEARCH_RE.search(text))
+    if not SEARCH_RE.search(text):
+        return False
+    return bool(DISCORD_CONTEXT_RE.search(text) or DISCORD_HISTORY_CONTEXT_RE.search(text))
 
 
 def _looks_like_reminder_management_request(text: str) -> bool:
