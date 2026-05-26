@@ -245,7 +245,7 @@ display:
   compact: false
   tool_progress: off
   cleanup_progress: false
-  interim_assistant_messages: false
+  interim_assistant_messages: true
   busy_input_mode: queue
   background_process_notifications: all
   bell_on_complete: false
