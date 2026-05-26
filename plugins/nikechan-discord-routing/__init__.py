@@ -1449,6 +1449,13 @@ def _route_intent(text: str) -> dict[str, Any]:
     else:
         llm_intent = _llm_route_intent(text, env)
         result = llm_intent or fallback
+        if result.get("action") == "search" and not _looks_like_search_request(text):
+            result = {
+                "action": "none",
+                "confidence": 0.0,
+                "reason": "general web search is not Discord history search",
+                "source": "guard",
+            }
 
     _ROUTE_INTENT_CACHE[text] = result
     if len(_ROUTE_INTENT_CACHE) > 512:
