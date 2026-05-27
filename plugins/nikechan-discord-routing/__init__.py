@@ -61,6 +61,21 @@ _PERSON_CONTEXT_CACHE: dict[str, tuple[float, str | None]] = {}
 _RECENT_DISCORD_MESSAGES: dict[str, list[dict[str, str]]] = {}
 
 PERSON_LOOKUP_RE = re.compile(r"(DB|データベース|ユーザ(?:ー)?記憶|人物|あだ名|ニックネーム|呼び方|誰|だれ)")
+NICKNAME_REQUEST_RE = re.compile(r"(呼んで|呼んでください|呼んでね|呼んでくれ|呼んでほしい|呼ぶように|call\s+me|refer\s+to\s+me|address\s+me|my\s+nickname|nickname\s+is|you\s+can\s+call\s+me)", re.I)
+NICKNAME_EXTRACT_PATTERNS = [
+    re.compile(
+        r"(?:私|わたし|僕|ぼく|俺|おれ|自分|うち|わし|わたくし|小生)(?:のこと|の事)?(?:は|を)?\s*(?P<nickname>.+?)\s*(?:と|って)\s*呼んで",
+        re.S,
+    ),
+    re.compile(
+        r"(?:今後|これから|以後)?\s*(?P<nickname>[^\n。]{1,40}?)\s*(?:と|って)\s*呼んで",
+        re.S,
+    ),
+]
+NICKNAME_FORBIDDEN_RE = re.compile(
+    r"(マスター|master|admin|administrator|owner|root|管理者|nikechan|ニケちゃん|aiニケ|ＡＩニケ)",
+    re.I,
+)
 
 
 def _visible_user_text(text: str) -> str:
@@ -475,7 +490,13 @@ def _truncate(value: Any, limit: int) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
-def _supabase_request(path: str, env: dict[str, str]) -> Any:
+def _supabase_request(
+    path: str,
+    env: dict[str, str],
+    *,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+) -> Any:
     url = env.get("SUPABASE_URL")
     key = (
         env.get("SUPABASE_SERVICE_ROLE_KEY")
@@ -484,16 +505,227 @@ def _supabase_request(path: str, env: dict[str, str]) -> Any:
     )
     if not url or not key:
         return None
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        headers["Prefer"] = "return=representation"
     req = urllib.request.Request(
         url.rstrip("/") + "/rest/v1/" + path,
-        headers={
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
-            "Accept": "application/json",
-        },
+        data=data,
+        method=method,
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=8) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        text = resp.read().decode("utf-8")
+    return json.loads(text) if text else None
+
+
+def _source_user_name(event: Any) -> str:
+    source = getattr(event, "source", None)
+    for attr in ("user_name", "display_name", "username", "sender_name"):
+        value = getattr(source, attr, None)
+        if value:
+            return str(value)
+    return "Discordユーザー"
+
+
+def _fallback_extract_self_nickname_request(text: str) -> str | None:
+    cleaned = _visible_user_text(text)
+    cleaned = re.sub(r"<@!?\d+>", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" 　")
+    if not cleaned or not NICKNAME_REQUEST_RE.search(cleaned):
+        return None
+    for pattern in NICKNAME_EXTRACT_PATTERNS:
+        match = pattern.search(cleaned)
+        if not match:
+            continue
+        candidate = match.group("nickname") or ""
+        candidate = re.sub(r"^.*(?:略して|略称は|略称で|あだ名は|ニックネームは|呼び名は)\s*", "", candidate)
+        candidate = re.sub(r"^(?:だから|じゃあ|では|なら|今後|これから|以後)\s*", "", candidate)
+        candidate = re.sub(r"^(?:名前は|呼び方は)\s*", "", candidate)
+        candidate = candidate.strip(" 　。、,.!！?？:：;；『』「」\"'`（）()[]【】")
+        candidate = re.sub(r"\s+", "", candidate)
+        if "を" in candidate:
+            return None
+        if _valid_nickname(candidate):
+            return candidate
+        return None
+    return None
+
+
+def _llm_extract_self_nickname_request(text: str, env: dict[str, str]) -> str | None:
+    config = _aux_llm_config(env)
+    if config is None:
+        return None
+    token, base_url, model = config
+    cleaned = _visible_user_text(text)
+    prompt = (
+        "Decide whether this Discord message is the speaker asking the bot to call THEM by a nickname. "
+        "Support Japanese, English, and casual phrasing. Output JSON only.\n"
+        "Return {\"ok\":true,\"nickname\":\"...\"} only when the speaker is clearly setting their own nickname/call name.\n"
+        "If a long name and a short form are both provided, choose the requested short form after phrases like \"for short\", \"short for\", \"略して\".\n"
+        "Return {\"ok\":false,\"reason\":\"...\"} for third-party nickname changes, jokes, ambiguous references, or requests to call someone else something.\n"
+        "Reject nicknames that imply authority or identity confusion: master, admin, owner, root, 管理者, マスター, nikechan, ニケちゃん.\n"
+        "Nickname must be the literal requested call name, max 24 chars, no URLs, no mentions.\n\n"
+        f"message: {cleaned}"
+    )
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a strict classifier for safe Discord nickname updates. Output JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 220,
+    }
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/chat/completions",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=max(4, _config_int("nickname_update_llm_timeout_seconds", 8))) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        match = re.search(r"\{.*\}", content, flags=re.S)
+        parsed = json.loads(match.group(0) if match else content)
+    except Exception as exc:
+        logger.debug("nikechan-discord-routing nickname LLM extract failed: %s", exc)
+        return None
+    if not isinstance(parsed, dict) or not parsed.get("ok"):
+        return None
+    nickname = str(parsed.get("nickname") or "").strip(" 　。、,.!！?？:：;；『』「」\"'`（）()[]【】")
+    nickname = re.sub(r"\s+", " ", nickname).strip()
+    if _valid_nickname(nickname):
+        return nickname
+    return None
+
+
+def _extract_self_nickname_request(text: str, env: dict[str, str] | None = None) -> str | None:
+    cleaned = _visible_user_text(text)
+    if not NICKNAME_REQUEST_RE.search(cleaned):
+        return None
+    env = env or _load_env()
+    return _llm_extract_self_nickname_request(cleaned, env) or _fallback_extract_self_nickname_request(cleaned)
+
+
+def _valid_nickname(value: str) -> bool:
+    if not value or len(value) > 24:
+        return False
+    if value.startswith("/") or "http://" in value.lower() or "https://" in value.lower():
+        return False
+    if "<@" in value or "@everyone" in value.lower() or "@here" in value.lower():
+        return False
+    if NICKNAME_FORBIDDEN_RE.search(value):
+        return False
+    return True
+
+
+def _discord_account_and_user(env: dict[str, str], discord_user_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    platform_id = urllib.parse.quote(discord_user_id, safe="")
+    accounts = _supabase_request(
+        "platform_accounts"
+        f"?platform=eq.discord&platform_user_id=eq.{platform_id}"
+        "&select=user_id,username,display_name,guild_nickname&limit=1",
+        env,
+    ) or []
+    account = accounts[0] if accounts else None
+    if not account or not account.get("user_id"):
+        return account, None
+    uid = urllib.parse.quote(str(account.get("user_id")), safe="")
+    rows = _supabase_request(f"users?id=eq.{uid}&select=*&limit=1", env) or []
+    return account, rows[0] if rows else None
+
+
+def _update_discord_nickname(text: str, event: Any) -> dict[str, Any] | None:
+    if not _config_bool("nickname_update", True):
+        return None
+    discord_user_id = _source_user_id(event)
+    if not discord_user_id:
+        return {"ok": False, "error": "発言者IDを取得できませんでした。"}
+    env = _load_env()
+    nickname = _extract_self_nickname_request(text, env)
+    if not nickname:
+        return None
+    account, user = _discord_account_and_user(env, discord_user_id)
+    if not user or not user.get("id"):
+        return {"ok": False, "error": "人物DBにこのDiscordユーザーが見つかりませんでした。", "nickname": nickname}
+    user_id = str(user.get("id"))
+    previous = user.get("nickname")
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    uid = urllib.parse.quote(user_id, safe="")
+    _supabase_request(
+        f"users?id=eq.{uid}",
+        env,
+        method="PATCH",
+        body={"nickname": nickname, "updated_at": now},
+    )
+    source_message_id = _source_message_id(event) or ""
+    source_url = ""
+    guild = _source_guild_id(event, env) or ""
+    channel = _current_channel(event) or ""
+    if guild and channel and source_message_id:
+        source_url = f"https://discord.com/channels/{guild}/{channel}/{source_message_id}"
+    episode = f"Discordで本人から呼び方の指定があり、nicknameを「{nickname}」に更新した。"
+    if previous and previous != nickname:
+        episode += f" 以前の呼び方: 「{previous}」。"
+    if source_url:
+        episode += f" 元メッセージ: {source_url}"
+    try:
+        _supabase_request(
+            "contact_episodes",
+            env,
+            method="POST",
+            body={
+                "user_id": user_id,
+                "content": episode[:500],
+                "source": "discord",
+                "event_type": "interaction",
+                "source_table": "discord_messages",
+                "source_record_id": source_message_id,
+            },
+        )
+    except Exception as exc:
+        logger.debug("nikechan-discord-routing nickname episode insert failed: %s", exc)
+    _PERSON_CONTEXT_CACHE.pop(discord_user_id, None)
+    logger.info(
+        "nikechan-discord-routing nickname updated: discord_user=%s user_id=%s previous=%r nickname=%r",
+        discord_user_id,
+        user_id,
+        previous,
+        nickname,
+    )
+    return {
+        "ok": True,
+        "user_id": user_id,
+        "display_name": _source_user_name(event),
+        "previous_nickname": previous,
+        "nickname": nickname,
+    }
+
+
+def _rewrite_discord_nickname_update(text: str, event: Any) -> dict[str, str] | None:
+    result = _update_discord_nickname(text, event)
+    if result is None:
+        return None
+    rewritten = (
+        "[DISCORD_NICKNAME_UPDATE_RESULT]\n"
+        f"元の発言: {text}\n\n"
+        "以下は公開Discord向けの安全なnickname更新helperの結果です。"
+        "本人が自分の呼び方を明示した場合だけ、現在の発言者本人のnicknameを更新します。"
+        "DB内部IDやSupabaseの詳細は公開応答に出さず、更新できたかだけを自然に短く伝えてください。"
+        "ok=false の場合は、更新できなかったことを短く伝えてください。\n\n"
+        "```json\n"
+        f"{json.dumps(result, ensure_ascii=False, indent=2)}\n"
+        "```"
+    )
+    return {"action": "rewrite", "text": rewritten}
 
 
 def _person_context_for_event(event: Any) -> str | None:
@@ -2250,6 +2482,10 @@ def register(ctx):
             # Discord/person context here turns commands like /reset into
             # ordinary user text.
             return None
+        nickname_routed = _rewrite_discord_nickname_update(text, event)
+        if nickname_routed:
+            _remember_recent_message(event)
+            return nickname_routed
         if _config_bool("should_reply", False):
             _discord_reaction_rest(event, "👀")
             decision = _should_reply(event)
