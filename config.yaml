@@ -272,6 +272,12 @@ discord:
   history_backfill_limit: 50
   reactions: true
   server_actions: create_thread
+  allow_admin_from:
+  - "576031815945420812"
+  user_allowed_commands: []
+  group_allow_admin_from:
+  - "576031815945420812"
+  group_user_allowed_commands: []
 timezone: Asia/Tokyo
 onboarding:
   seen:
@@ -280,3 +286,5 @@ onboarding:
 plugins:
   enabled:
   - nikechan-discord-routing
+approvals:
+  destructive_slash_confirm: true
