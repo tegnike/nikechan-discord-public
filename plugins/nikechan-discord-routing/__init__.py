@@ -587,7 +587,7 @@ def _llm_extract_self_nickname_request(text: str, env: dict[str, str]) -> str | 
         base_url.rstrip("/") + "/chat/completions",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         method="POST",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "OpenAI/Python 1.0"},
     )
     try:
         with urllib.request.urlopen(req, timeout=max(4, _config_int("nickname_update_llm_timeout_seconds", 8))) as resp:
@@ -1255,7 +1255,7 @@ def _llm_should_reply(text: str, event: Any, env: dict[str, str]) -> dict[str, A
         base_url + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),
         method="POST",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": "OpenAI/Python 1.0"},
     )
     try:
         with urllib.request.urlopen(req, timeout=max(3, _config_int("should_reply_llm_timeout_seconds", 8))) as resp:
@@ -1448,7 +1448,7 @@ def _llm_search_plan(text: str, env: dict[str, str]) -> dict[str, Any] | None:
         base_url + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),
         method="POST",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": "OpenAI/Python 1.0"},
     )
     try:
         with urllib.request.urlopen(req, timeout=12) as resp:
@@ -1509,7 +1509,7 @@ def _llm_reminder_intent(text: str, env: dict[str, str]) -> dict[str, Any] | Non
         base_url + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),
         method="POST",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": "OpenAI/Python 1.0"},
     )
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
@@ -1606,7 +1606,7 @@ def _llm_route_intent(text: str, env: dict[str, str]) -> dict[str, Any] | None:
         base_url + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),
         method="POST",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": "OpenAI/Python 1.0"},
     )
     try:
         with urllib.request.urlopen(req, timeout=max(3, _config_int("route_intent_llm_timeout_seconds", 6))) as resp:
@@ -2382,6 +2382,65 @@ def _rewrite_music_audio(text: str, event: Any) -> dict[str, str] | None:
     return {"action": "rewrite", "text": rewritten}
 
 
+
+def _looks_like_skill_list_request(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(スキル|skill).{0,30}(一覧|リスト|具体|教えて|何|なに|どんな|使える|持ってる|ある)|"
+            r"(一覧|リスト|具体|教えて|何|なに|どんな|使える|持ってる|ある).{0,30}(スキル|skill)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _discord_skill_list_payload() -> str:
+    try:
+        from hermes_cli.commands import discord_skill_commands_by_category
+        categories, uncategorized, hidden = discord_skill_commands_by_category(set())
+        rows: list[dict[str, str]] = []
+        for category, items in categories.items():
+            for name, description, cmd_key in items:
+                rows.append(
+                    {
+                        "name": name,
+                        "command": cmd_key,
+                        "category": category,
+                        "description": description,
+                    }
+                )
+        for name, description, cmd_key in uncategorized:
+            rows.append(
+                {
+                    "name": name,
+                    "command": cmd_key,
+                    "category": "uncategorized",
+                    "description": description,
+                }
+            )
+        return json.dumps({"count": len(rows), "hidden_count": hidden, "skills": rows}, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+def _rewrite_skill_list_request(text: str, event: Any) -> dict[str, str] | None:
+    if not _looks_like_skill_list_request(text):
+        return None
+    payload = _discord_skill_list_payload()
+    rewritten = (
+        "[NIKECHAN_DISCORD_SKILL_LIST]\n"
+        f"元の依頼: {text}\n\n"
+        "以下は現在の公開Discord profileで /skill autocomplete に登録されているHermesスキル一覧です。"
+        "この一覧を正として答え、スキル一覧を確認するためにWeb検索しないでください。"
+        "Web Search/Web Extractはツールであり、ここでいうHermesスキル一覧とは別物です。"
+        "公開Discordではterminal/file/admin系toolsetは開放されていないため、スキルの説明と実行可能な権限は区別してください。"
+        "discord-freezeのような自律cron専用機能は通常チャットから実行できるスキルとして説明しないでください。\n\n"
+        "```json\n"
+        f"{payload}\n"
+        "```"
+    )
+    return {"action": "rewrite", "text": rewritten}
+
 def _rewrite(event: Any) -> dict[str, str] | None:
     text = getattr(event, "text", "") or ""
     if not isinstance(text, str):
@@ -2389,6 +2448,10 @@ def _rewrite(event: Any) -> dict[str, str] | None:
     text = _visible_user_text(text)
 
     routed = _rewrite_discord_message_url(text, event)
+    if routed:
+        return routed
+
+    routed = _rewrite_skill_list_request(text, event)
     if routed:
         return routed
 
