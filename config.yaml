@@ -1,8 +1,8 @@
 model:
-  default: glm-5.1
-  provider: custom
-  base_url: https://crof.ai/v1
-  api_mode: chat_completions
+  default: gpt-5.3-codex-spark
+  provider: openai-codex
+  base_url: https://chatgpt.com/backend-api/codex
+  api_mode: codex_responses
 terminal:
   backend: local
   cwd: /Users/nikenike/.hermes/profiles/nikechan-discord-public/workspace
