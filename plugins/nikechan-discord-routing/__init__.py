@@ -52,7 +52,7 @@ ARXIV_CONTEXT_RE = re.compile(r"(arxiv|論文|paper|ペーパー)", re.IGNORECAS
 FETCH_LIMIT = 350
 MAX_PAYLOAD_CHARS = 70000
 MAX_RESEARCH_PAYLOAD_CHARS = 60000
-GENERIC_CHANNEL_WORDS = {"discord", "Discord", "ディスコ", "この", "現在", "今いる"}
+GENERIC_CHANNEL_WORDS = {"discord", "Discord", "ディスコ", "この", "現在", "今いる", "このサーバー", "このサーバーの", "サーバー", "サーバーの", "鯖", "鯖の"}
 logger = logging.getLogger(__name__)
 _REMINDER_INTENT_CACHE: dict[str, dict[str, Any]] = {}
 _ROUTE_INTENT_CACHE: dict[str, dict[str, Any]] = {}
@@ -245,6 +245,12 @@ def _channel(text: str, event: Any) -> tuple[str | None, str]:
     if mention:
         return mention.group(1), f"<#{mention.group(1)}>"
 
+    # If a Discord snowflake is included in a summary/search request, prefer it
+    # over Japanese deictic phrases like "このチャンネル" that appear earlier.
+    numeric = re.search(r"(?<!\d)(\d{17,20})(?!\d)", text)
+    if numeric:
+        return numeric.group(1), numeric.group(1)
+
     hash_name = re.search(r"#([^\s、。]+)", text)
     if hash_name:
         name = hash_name.group(1).strip()
@@ -255,7 +261,7 @@ def _channel(text: str, event: Any) -> tuple[str | None, str]:
     chan = re.search(r"([A-Za-z0-9_\-\u3040-\u30ff\u3400-\u9fffー・]+?)\s*チャンネル", text)
     if chan:
         name = chan.group(1).strip(" 「」『』【】()（）")
-        if name:
+        if name and name not in GENERIC_CHANNEL_WORDS:
             return name, f"{name}チャンネル"
 
     short = re.search(
