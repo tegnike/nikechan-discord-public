@@ -408,7 +408,11 @@ def discord_send(channel_id: str, content: str, requester_id: str = "") -> None:
         f"https://discord.com/api/v10/channels/{channel_id}/messages",
         data=json.dumps(payload).encode("utf-8"),
         method="POST",
-        headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "AI-Nikechan-Hermes-Reminder/1.0",
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
@@ -447,6 +451,7 @@ def dispatch(args: argparse.Namespace) -> int:
             try:
                 discord_send(str(rem["channel_id"]), reminder_content(rem), str(rem.get("requester_id") or ""))
                 sent.append(rem["id"])
+                rem.pop("last_error", None)
                 rec = rem.get("recurrence")
                 if isinstance(rec, dict):
                     next_at = next_recurrence(due_at, rec)
