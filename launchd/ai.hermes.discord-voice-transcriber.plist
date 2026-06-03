@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.hermes.discord-voice-transcriber</string>
+  <key>Comment</key>
+  <string>Discord VC recorder/transcriber for nikechan-discord-public</string>
+  <key>UserName</key>
+  <string>nikenike</string>
+  <key>GroupName</key>
+  <string>staff</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>node</string>
+    <string>/Users/nikenike/.hermes/profiles/nikechan-discord-public/bin/discord-voice-transcriber.mjs</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/nikenike/.hermes/profiles/nikechan-discord-public</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/nikenike</string>
+    <key>HERMES_HOME</key>
+    <string>/Users/nikenike/.hermes/profiles/nikechan-discord-public</string>
+    <key>PATH</key>
+    <string>/Users/nikenike/.hermes/hermes-agent/node_modules/.bin:/usr/local/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>DISCORD_VOICE_CHANNEL_ID</key>
+    <string>1452811457925480580</string>
+    <key>DISCORD_VOICE_START_GRACE_SECONDS</key>
+    <string>30</string>
+    <key>DISCORD_VOICE_END_GRACE_SECONDS</key>
+    <string>30</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/nikenike/.hermes/profiles/nikechan-discord-public/logs/voice-transcriber.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/nikenike/.hermes/profiles/nikechan-discord-public/logs/voice-transcriber.error.log</string>
+</dict>
+</plist>

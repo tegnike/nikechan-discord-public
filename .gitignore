@@ -21,8 +21,10 @@ channel_directory.json
 .clean_shutdown
 
 # caches / generated files
+node_modules/
 cache/
 audio_cache/
+voice_sessions/
 image_cache/
 pairing/
 plans/
