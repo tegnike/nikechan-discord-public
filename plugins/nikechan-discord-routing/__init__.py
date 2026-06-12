@@ -973,6 +973,8 @@ def _person_lookup_context_for_event(text: str, event: Any) -> str | None:
 def _with_person_context(text: str, event: Any) -> str:
     if "[DISCORD_PERSON_CONTEXT]" in text:
         return text
+    if any(marker in text for marker in ("[DISCORD_SUMMARY_DATA]", "[DISCORD_SEARCH_DATA]", "[DISCORD_MESSAGE_LINK_DATA]")):
+        return text
     blocks = []
     recent_context = _recent_channel_context(event)
     if recent_context:

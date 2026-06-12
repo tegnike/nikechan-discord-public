@@ -252,7 +252,7 @@ display:
   skin: default
 discord:
   gateway_restart_notification: false
-  require_mention: false
+  require_mention: true
   should_reply: true
   should_reply_silent_ingest: true
   should_reply_reactions: true
@@ -265,7 +265,8 @@ discord:
   person_context_recent_episodes: 3
   person_context_cache_seconds: 300
   free_response_channels: 1404724174890602496
-  allowed_channels: 1404724174890602496
+  mention_role_ids: 1454146494427824168
+  allowed_channels: "*"
   auto_thread: false
   thread_require_mention: false
   history_backfill: true
