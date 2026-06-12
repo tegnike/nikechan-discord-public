@@ -16,13 +16,15 @@ from pathlib import Path
 BIN_DIR = Path(__file__).resolve().parent
 HISTORY = str(BIN_DIR / "discord-history")
 FREEZE = str(BIN_DIR / "discord-freeze")
-DEFAULT_WINDOW_MINUTES = 5
+DEFAULT_WINDOW_MINUTES = 10
 DEFAULT_DURATION = "12h"
 DEFAULT_LIMIT_PER_CHANNEL = 80
 MESSAGE_FLOOD_THRESHOLD = 14
 DUPLICATE_THRESHOLD = 5
 MENTIONS_IN_ONE_MESSAGE_THRESHOLD = 8
 MENTIONS_TOTAL_THRESHOLD = 20
+AI_NIKECHAN_MENTION_THRESHOLD = 5
+DEFAULT_AI_NIKECHAN_MENTION_IDS = {"1454145423315828736", "1454146494427824168"}
 COOLDOWN_SECONDS = 60 * 60
 SOLICITATION_CONTACT_RE = re.compile(
     r"(chatwork|チャットワーク|telegram|テレグラム|line\s*id|ライン\s*id|whatsapp|skype|"
@@ -123,6 +125,31 @@ def mention_count(message: dict) -> int:
     return count
 
 
+def csv_ids(value: str | None) -> set[str]:
+    return {part.strip() for part in (value or "").split(",") if part.strip()}
+
+
+def ai_nikechan_mention_ids() -> set[str]:
+    ids = set(DEFAULT_AI_NIKECHAN_MENTION_IDS)
+    ids.update(csv_ids(ENV.get("DISCORD_AUTOFREEZE_AI_NIKECHAN_MENTION_IDS")))
+    ids.update(csv_ids(ENV.get("DISCORD_BOT_USER_ID")))
+    ids.update(csv_ids(ENV.get("DISCORD_MENTION_ROLE_IDS")))
+    return ids
+
+
+def dedicated_channel_ids() -> set[str]:
+    ids = csv_ids(ENV.get("DISCORD_AUTOFREEZE_DEDICATED_CHANNELS"))
+    ids.update(csv_ids(ENV.get("DISCORD_HOME_CHANNEL")))
+    ids.update(csv_ids(ENV.get("DISCORD_FREE_RESPONSE_CHANNELS")))
+    return ids
+
+
+def ai_nikechan_mention_count(message: dict) -> int:
+    content = message.get("content") or ""
+    targets = ai_nikechan_mention_ids()
+    return sum(1 for mention_id in re.findall(r"<@[!&]?(\d+)>", content) if mention_id in targets)
+
+
 def solicitation_score(message: dict) -> tuple[int, list[str]]:
     content = message.get("content") or ""
     compact = re.sub(r"\s+", " ", content).strip()
@@ -199,6 +226,8 @@ def charge_for(reason: str | None, sample: str = "") -> str:
         if "line" in text or "telegram" in text or "whatsapp" in text:
             return "外部連絡先誘導案件勧誘罪"
         return "外部連絡先つき案件勧誘罪"
+    if "ai nikechan mention spam" in text:
+        return "専用外AIニケちゃん大量呼び出し罪"
     if "message flood" in text:
         return "短時間大量投稿罪"
     if "duplicate message" in text:
@@ -257,6 +286,16 @@ def decide(messages: list[dict], now: dt.datetime) -> list[dict]:
         top_text, top_count = duplicate_counter.most_common(1)[0] if duplicate_counter else ("", 0)
         total_mentions = sum(mention_count(m) for m in user_messages)
         max_mentions = max((mention_count(m) for m in user_messages), default=0)
+        dedicated_channels = dedicated_channel_ids()
+        ai_nikechan_messages = [
+            m
+            for m in user_messages
+            if m.get("_channel_id") not in dedicated_channels and ai_nikechan_mention_count(m) > 0
+        ]
+        ai_nikechan_mentions = sum(ai_nikechan_mention_count(m) for m in ai_nikechan_messages)
+        ai_nikechan_threshold = int(
+            ENV.get("DISCORD_AUTOFREEZE_AI_NIKECHAN_MENTION_THRESHOLD", AI_NIKECHAN_MENTION_THRESHOLD)
+        )
         top_solicitation = max((solicitation_score(m) + (m,) for m in user_messages), key=lambda item: item[0])
         solicitation_points, solicitation_signals, solicitation_message = top_solicitation
 
@@ -270,6 +309,15 @@ def decide(messages: list[dict], now: dt.datetime) -> list[dict]:
             reason = f"automated moderation: message flood ({len(user_messages)} messages in window)"
         elif top_count >= DUPLICATE_THRESHOLD:
             reason = f"automated moderation: repeated duplicate message ({top_count} times)"
+        elif ai_nikechan_threshold > 0 and ai_nikechan_mentions >= ai_nikechan_threshold:
+            reason = (
+                "automated moderation: ai nikechan mention spam outside dedicated channel "
+                f"({ai_nikechan_mentions} mentions in window)"
+            )
+            evidence = sorted(
+                ai_nikechan_messages,
+                key=lambda m: message_ts(m) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+            )[-5:]
         elif max_mentions >= MENTIONS_IN_ONE_MESSAGE_THRESHOLD:
             reason = f"automated moderation: excessive mentions in one message ({max_mentions})"
         elif total_mentions >= MENTIONS_TOTAL_THRESHOLD:
