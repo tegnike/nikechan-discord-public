@@ -59,6 +59,7 @@ let startTimer = null;
 let stopTimer = null;
 let transcribeChain = Promise.resolve();
 let chunkSeq = 0;
+let geminiUnavailable = null;
 const activeUserStreams = new Set();
 
 function intEnv(name, fallback) {
@@ -326,7 +327,10 @@ async function transcribeChunk(chunk) {
   if (!session) return;
   if (!GEMINI_API_KEY) {
     log("skip transcription because GEMINI_API_KEY is missing");
-    tryUnlink(chunk.audio_path);
+    return;
+  }
+  if (geminiUnavailable) {
+    appendSkippedTranscript(chunk, geminiUnavailable.error);
     return;
   }
   let text = "";
@@ -335,9 +339,15 @@ async function transcribeChunk(chunk) {
     text = await geminiTranscribe(chunk.audio_path);
   } catch (err) {
     error = String(err);
-    text = "[transcription failed]";
+    if (isFatalGeminiError(error)) {
+      geminiUnavailable = { at: new Date().toISOString(), error };
+      log("gemini transcription disabled until worker restart", { error });
+      text = "[transcription failed: Gemini unavailable; audio saved for retry]";
+    } else {
+      text = "[transcription failed]";
+    }
   } finally {
-    tryUnlink(chunk.audio_path);
+    if (!error) tryUnlink(chunk.audio_path);
   }
   const transcript = {
     seq: chunk.seq,
@@ -351,6 +361,25 @@ async function transcribeChunk(chunk) {
   session.transcripts.push(transcript);
   appendJsonl("transcripts.jsonl", transcript);
   log("transcribed voice chunk", { seq: chunk.seq, user: chunk.display_name, chars: text.length, error });
+}
+
+function appendSkippedTranscript(chunk, reason) {
+  const transcript = {
+    seq: chunk.seq,
+    user_id: chunk.user_id,
+    display_name: chunk.display_name,
+    start_ms: chunk.start_ms,
+    end_ms: chunk.end_ms,
+    text: "[transcription skipped: Gemini unavailable; audio saved for retry]",
+    error: reason,
+  };
+  session.transcripts.push(transcript);
+  appendJsonl("transcripts.jsonl", transcript);
+  log("skipped voice transcription", { seq: chunk.seq, user: chunk.display_name, reason });
+}
+
+function isFatalGeminiError(error) {
+  return /monthly spending cap|API key expired|API_KEY_INVALID/i.test(String(error || ""));
 }
 
 async function geminiTranscribe(audioPath) {
@@ -389,6 +418,15 @@ async function summarizeSession(finalSession) {
   if (!GEMINI_API_KEY || !transcriptText.trim()) {
     return { summary: transcriptText ? "文字起こしは保存しました。要約はGemini API key未設定のため未生成です。" : "文字起こし対象の発話がありませんでした。", transcriptPath };
   }
+  if (geminiUnavailable) {
+    const summary = [
+      "Gemini APIが利用できないため、要約は生成できませんでした。",
+      "音声ファイルはサブMac上のvoice_sessions配下に保存しています。",
+      "Gemini API keyまたは課金上限を復旧後、このセッションを再処理してください。",
+    ].join("\n");
+    fs.writeFileSync(path.join(finalSession.dir, "summary.md"), `${summary}\n`);
+    return { summary, transcriptPath };
+  }
 
   const prompt = [
     "次のDiscordボイスチャット文字起こしを日本語で短く要約してください。",
@@ -405,8 +443,13 @@ async function summarizeSession(finalSession) {
   const response = await geminiGenerate({
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     generationConfig: { temperature: 0.2 },
+  }).catch((error) => {
+    log("summary generation failed", { error: String(error) });
+    return null;
   });
-  const summary = extractGeminiText(response).trim() || "要約を生成できませんでした。";
+  const summary = response
+    ? extractGeminiText(response).trim() || "要約を生成できませんでした。"
+    : "文字起こしは保存しましたが、要約生成に失敗しました。添付の文字起こしを確認してください。";
   fs.writeFileSync(path.join(finalSession.dir, "summary.md"), `${summary}\n`);
   return { summary, transcriptPath };
 }
