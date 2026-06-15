@@ -42,6 +42,16 @@ SOLICITATION_OPENER_RE = re.compile(
     r"looking for|if interested|feel free)",
     re.I,
 )
+SOLICITATION_CROWDSOURCING_PROFILE_RE = re.compile(
+    r"(crowdworks|クラウドワークス|lancers|ランサーズ|pro\s*crowdworker|top\s*class|"
+    r"ソフトウェアエンジニア|webシステム開発|ai開発|モバイルアプリ開発|グローバルチーム)",
+    re.I,
+)
+SOLICITATION_PARTNER_SEEKING_RE = re.compile(
+    r"(案件.*紹介|案件をご紹介|お仕事.*(?:できれば|募集|紹介)|ご一緒にお仕事|"
+    r"企業様|個人様|エージェンシー|パートナー様|技術的な課題|安心してお任せ)",
+    re.I,
+)
 
 
 def load_env() -> dict:
@@ -168,6 +178,12 @@ def solicitation_score(message: dict) -> tuple[int, list[str]]:
     if SOLICITATION_OPENER_RE.search(compact):
         score += 1
         signals.append("unsolicited_opener")
+    if SOLICITATION_CROWDSOURCING_PROFILE_RE.search(compact):
+        score += 2
+        signals.append("crowdsourcing_engineer_profile")
+    if SOLICITATION_PARTNER_SEEKING_RE.search(compact):
+        score += 2
+        signals.append("client_or_partner_seeking")
     return score, signals
 
 
@@ -226,6 +242,8 @@ def charge_for(reason: str | None, sample: str = "") -> str:
         if "line" in text or "telegram" in text or "whatsapp" in text:
             return "外部連絡先誘導案件勧誘罪"
         return "外部連絡先つき案件勧誘罪"
+    if "public business solicitation" in text:
+        return "公開チャンネル営業勧誘罪"
     if "ai nikechan mention spam" in text:
         return "専用外AIニケちゃん大量呼び出し罪"
     if "message flood" in text:
@@ -324,6 +342,13 @@ def decide(messages: list[dict], now: dt.datetime) -> list[dict]:
             reason = f"automated moderation: excessive mentions in window ({total_mentions})"
         elif solicitation_points >= 5 and "external_contact" in solicitation_signals:
             reason = "automated moderation: unsolicited external-contact business solicitation"
+            evidence = [solicitation_message]
+        elif (
+            solicitation_points >= 7
+            and "crowdsourcing_engineer_profile" in solicitation_signals
+            and "client_or_partner_seeking" in solicitation_signals
+        ):
+            reason = "automated moderation: unsolicited public business solicitation"
             evidence = [solicitation_message]
 
         if reason:
