@@ -47,7 +47,7 @@ Do not create cron jobs, delete messages, timeout users, change roles, or perfor
    - If the user says "ここ数時間", default to the last 3 hours unless another window is obvious from context.
    - If the user says "今日", use today's range in the profile timezone.
    - If the user says "昨日", use yesterday's range in the profile timezone.
-   - If no time range is provided, default to the latest 100 messages.
+   - If no time range is provided, default to the latest 120 messages.
    - For "yesterday/today", interpret in the profile timezone.
 2. Fetch messages with:
    ```bash
@@ -55,7 +55,27 @@ Do not create cron jobs, delete messages, timeout users, change roles, or perfor
    ```
    Omit `--from`/`--to` when not specified. Use `--guild GUILD_ID` for the current server when available.
 3. If the command returns too many messages or empty content, explain the limitation and ask for a narrower range.
-4. Summarize in Japanese unless the user asks otherwise.
+4. If the user asks for a *broader* analysis (`広い範囲`, `もっと`, `120件以上`, etc.), run a two-pass strategy:
+   - 第1段階: 比較用の基準サンプルとして `--limit 120` を先に取れるなら1回取得（既存運用と比較できるよう、可能なら保存）。
+   - 第2段階: 要求どおりに広げる（`--limit 500` から開始し、必要時 `--limit 1000`）。
+   - 2回取得したJSONは、いずれも**discord-summary の二次要約結果よりも `discord-history` の生データを優先して分析**する。
+5. Summarize in Japanese unless the user asks otherwise.
+6. Keep output action-oriented: 重要テーマ → 定量指標 → 未解決/次アクション。依頼が「分析」系なら短い要約よりも再利用可能な形（比較可能な数値＋傾向）を優先。
+
+## Extended Analysis Template（analysis-heavy request）
+
+参考: `references/discord-summary-broad-analysis.md`
+
+補助スクリプト: `scripts/analyze-channel-messages.py`（取得JSONから定量要約を再現可能に出力）
+
+When the request is explicitly for channel analysis (not just a short recap), structure as:
+
+- `## 全体俯瞰`：1〜3行で主流テーマ
+- `## 定量サマリ`：件数、投稿者分布、bot/human比、日次・時間帯、カテゴリ主要件数
+  - 投稿者名は `display_name` を優先し、無い場合は `username` を使う。
+- `## 話題フロー`：時系列でのテーマ遷移（例: 運用トラブル→機能検証→雑談→収益化検討）
+- `## 未解決・次アクション`：次に決めるべき事項、必要なら実行提案
+- `## 補足`：制約（欠損・重複・観測ミス）を必要最小限
 
 ## Output Style
 
