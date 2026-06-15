@@ -1,5 +1,5 @@
 model:
-  default: gpt-5.3-codex-spark
+  default: gpt-5.5
   provider: openai-codex
   base_url: https://chatgpt.com/backend-api/codex
   api_mode: codex_responses

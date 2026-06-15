@@ -53,6 +53,7 @@ FETCH_LIMIT = 350
 MAX_PAYLOAD_CHARS = 70000
 MAX_RESEARCH_PAYLOAD_CHARS = 60000
 GENERIC_CHANNEL_WORDS = {"discord", "Discord", "ディスコ", "この", "現在", "今いる", "このサーバー", "このサーバーの", "サーバー", "サーバーの", "鯖", "鯖の"}
+DEICTIC_CHANNEL_SUFFIX_RE = re.compile(r"(?:^|の)(?:この|その|現在|今いる|同じ)$")
 logger = logging.getLogger(__name__)
 _REMINDER_INTENT_CACHE: dict[str, dict[str, Any]] = {}
 _ROUTE_INTENT_CACHE: dict[str, dict[str, Any]] = {}
@@ -240,6 +241,11 @@ def _time_window(text: str, env: dict[str, str]) -> tuple[str | None, str | None
     return None, None, "最新"
 
 
+def _is_generic_channel_name(name: str) -> bool:
+    normalized = re.sub(r"\s+", "", name).strip(" 「」『』【】()（）")
+    return normalized in GENERIC_CHANNEL_WORDS or bool(DEICTIC_CHANNEL_SUFFIX_RE.search(normalized))
+
+
 def _channel(text: str, event: Any) -> tuple[str | None, str]:
     mention = re.search(r"<#(\d+)>", text)
     if mention:
@@ -261,7 +267,7 @@ def _channel(text: str, event: Any) -> tuple[str | None, str]:
     chan = re.search(r"([A-Za-z0-9_\-\u3040-\u30ff\u3400-\u9fffー・]+?)\s*チャンネル", text)
     if chan:
         name = chan.group(1).strip(" 「」『』【】()（）")
-        if name and name not in GENERIC_CHANNEL_WORDS:
+        if name and not _is_generic_channel_name(name):
             return name, f"{name}チャンネル"
 
     short = re.search(
@@ -270,7 +276,7 @@ def _channel(text: str, event: Any) -> tuple[str | None, str]:
     )
     if short:
         name = short.group(1).strip(" 「」『』【】()（）")
-        if name and name not in GENERIC_CHANNEL_WORDS:
+        if name and not _is_generic_channel_name(name):
             return name, name
 
     fallback = _current_channel(event)
