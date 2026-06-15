@@ -53,6 +53,8 @@ streaming:
   enabled: false
 skills:
   creation_nudge_interval: 15
+  disabled:
+    - youtube-content
   platform_disabled:
     discord:
       - airtable
@@ -140,13 +142,13 @@ skills:
       - weights-and-biases
       - writing-plans
       - xurl
+      - youtube-content
       - yuanbao
 agent:
   max_turns: 60
   verbose: false
   reasoning_effort: medium
   disabled_toolsets:
-    - terminal
     - file
     - memory
     - code_execution
@@ -211,6 +213,8 @@ platform_toolsets:
     - hermes-telegram
   discord:
     - web
+    - skills
+    - terminal
   whatsapp:
     - hermes-whatsapp
   slack:
@@ -258,7 +262,7 @@ discord:
   should_reply_reactions: true
   should_reply_llm_timeout_seconds: 6
   should_reply_llm_min_confidence: 0.55
-  should_reply_fast_path_confidence: 0.65
+  should_reply_fast_path_confidence: 0.95
   route_intent_llm_timeout_seconds: 15
   should_reply_context_messages: 5
   person_context: true
