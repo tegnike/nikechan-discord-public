@@ -1196,8 +1196,8 @@ def _recent_channel_context(event: Any) -> str:
     return "\n".join(lines)
 
 
-def _remember_recent_message(event: Any) -> None:
-    text = getattr(event, "text", "") or ""
+def _remember_recent_message(event: Any, text_override: str | None = None) -> None:
+    text = text_override if text_override is not None else (getattr(event, "text", "") or "")
     if not isinstance(text, str) or not text.strip():
         return
     channel = _current_channel(event)
@@ -1354,6 +1354,8 @@ def _should_reply_fast_path_threshold(event: Any) -> float:
 def _should_reply(event: Any) -> dict[str, Any]:
     text = getattr(event, "text", "") or ""
     if not isinstance(text, str) or not text.strip():
+        if _attachment_only_text(event):
+            return {"reply": True, "confidence": 1.0, "reason": "image attachment only", "source": "local"}
         return {"reply": False, "confidence": 1.0, "reason": "empty message", "source": "local"}
     if _looks_like_bare_test_message(text):
         return {"reply": False, "confidence": 1.0, "reason": "bare test marker", "source": "local"}
@@ -2489,6 +2491,49 @@ def _event_audio_sources(event: Any) -> list[str]:
     return sources
 
 
+def _event_media_items(event: Any) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    media_urls = list(getattr(event, "media_urls", None) or [])
+    media_types = list(getattr(event, "media_types", None) or [])
+    for idx, value in enumerate(media_urls):
+        if not value:
+            continue
+        items.append(
+            {
+                "url": str(value),
+                "type": str(media_types[idx] if idx < len(media_types) else ""),
+            }
+        )
+    for attachment in list(getattr(event, "attachments", None) or []):
+        if isinstance(attachment, dict):
+            url = attachment.get("url") or attachment.get("proxy_url") or attachment.get("filename") or ""
+            mtype = attachment.get("content_type") or attachment.get("type") or ""
+        else:
+            url = getattr(attachment, "url", None) or getattr(attachment, "filename", None) or ""
+            mtype = getattr(attachment, "content_type", None) or getattr(attachment, "type", None) or ""
+        if url:
+            items.append({"url": str(url), "type": str(mtype or "")})
+    return items
+
+
+def _attachment_only_text(event: Any) -> str:
+    text = getattr(event, "text", "") or ""
+    if isinstance(text, str) and text.strip():
+        return ""
+    image_count = 0
+    for item in _event_media_items(event):
+        mtype = item.get("type", "").lower()
+        lower = item.get("url", "").lower().split("?", 1)[0]
+        if mtype.startswith("image/") or lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif")):
+            image_count += 1
+    if image_count <= 0:
+        return ""
+    return (
+        f"(画像のみの投稿: {image_count}件の画像が添付されています。"
+        "画像の内容は直接確認できない場合があります。必要ならユーザーに説明を求めてください。)"
+    )
+
+
 def _direct_media_urls(text: str) -> list[str]:
     urls = [m.group(0).rstrip("。、)") for m in SUNO_URL_RE.finditer(text)]
     urls.extend(m.group(0).rstrip("。、)") for m in DIRECT_MEDIA_URL_RE.finditer(text))
@@ -2751,6 +2796,7 @@ def register(ctx):
         if "discord" not in _platform_name(event):
             return None
         text = getattr(event, "text", "") or ""
+        attachment_text = _attachment_only_text(event)
         if isinstance(text, str) and text.lstrip().startswith("/"):
             # Slash commands must stay at the beginning of the message so the
             # Hermes gateway command dispatcher can recognize them. Adding
@@ -2776,6 +2822,10 @@ def register(ctx):
                 )
                 _remember_recent_message(event)
                 return {"action": "skip", "reason": "should_reply_false"}
+        if attachment_text:
+            rewritten = _with_person_context(attachment_text, event)
+            _remember_recent_message(event, attachment_text)
+            return {"action": "rewrite", "text": rewritten}
         routed = _rewrite(event)
         if routed and routed.get("action") == "rewrite" and isinstance(routed.get("text"), str):
             routed["text"] = _with_person_context(routed["text"], event)

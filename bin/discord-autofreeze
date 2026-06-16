@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -90,6 +91,62 @@ def run_json(args: list[str], timeout: int = 45) -> dict:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"{' '.join(args[:2])} failed: {detail}")
     return json.loads(proc.stdout)
+
+
+def auth_access_token(provider: str) -> tuple[str, str | None] | None:
+    for auth_file in (HOME / "auth.json", Path.home() / ".hermes" / "auth.json"):
+        if not auth_file.exists():
+            continue
+        try:
+            data = json.loads(auth_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        credentials = (data.get("credential_pool") or {}).get(provider) or []
+        for credential in credentials:
+            token = credential.get("access_token")
+            if token:
+                return str(token), credential.get("base_url")
+    return None
+
+
+def aux_llm_config() -> tuple[str, str, str] | None:
+    provider = ENV.get("NIKECHAN_AUX_LLM_PROVIDER") or ENV.get("HERMES_INFERENCE_PROVIDER") or ""
+    if provider == "xai-oauth":
+        credential = auth_access_token("xai-oauth")
+        if not credential:
+            return None
+        token, credential_base_url = credential
+        base_url = (
+            ENV.get("NIKECHAN_AUX_LLM_BASE_URL")
+            or credential_base_url
+            or ENV.get("HERMES_INFERENCE_BASE_URL")
+            or "https://api.x.ai/v1"
+        ).rstrip("/")
+        model = ENV.get("NIKECHAN_AUX_LLM_MODEL") or ENV.get("HERMES_INFERENCE_MODEL") or "grok-4.3"
+        return token, base_url, model
+
+    api_key = ENV.get("NIKECHAN_AUX_LLM_API_KEY") or ENV.get("ALIBABA_CODING_PLAN_API_KEY") or ENV.get("DASHSCOPE_API_KEY")
+    if not api_key:
+        return None
+    base_url = (
+        ENV.get("NIKECHAN_AUX_LLM_BASE_URL")
+        or ENV.get("ALIBABA_CODING_PLAN_BASE_URL")
+        or "https://coding-intl.dashscope.aliyuncs.com/v1"
+    ).rstrip("/")
+    model = ENV.get("NIKECHAN_AUX_LLM_MODEL") or "qwen3.6-plus"
+    return api_key, base_url, model
+
+
+def json_from_text(text: str) -> dict:
+    raw = text.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        raw = raw[start : end + 1]
+    return json.loads(raw)
 
 
 def sanitize_error(detail: str) -> str:
@@ -286,6 +343,78 @@ def collect_messages(guild: str, since: str, limit: int) -> tuple[list[dict], li
     return messages, errors, skipped_inaccessible
 
 
+def compact_message_for_review(message: dict) -> dict:
+    attachments = [
+        str(a.get("filename") or a.get("url") or "")[:160]
+        for a in (message.get("attachments") or [])
+        if a.get("filename") or a.get("url")
+    ]
+    embeds = [
+        " ".join(str(part or "") for part in (e.get("title"), e.get("description"), e.get("url"))).strip()[:240]
+        for e in (message.get("embeds") or [])
+        if e.get("title") or e.get("description") or e.get("url")
+    ]
+    return {
+        "timestamp": message.get("timestamp"),
+        "channel": message.get("_channel_name") or message.get("_channel_id"),
+        "content": (message.get("content") or "")[:500],
+        "attachments": attachments[:5],
+        "embeds": embeds[:3],
+        "mentions": mention_count(message),
+    }
+
+
+def judge_message_flood_with_llm(user_messages: list[dict]) -> tuple[bool, str]:
+    llm_config = aux_llm_config()
+    if not llm_config:
+        return False, "llm_unavailable"
+    api_key, base_url, model = llm_config
+    review_messages = [
+        compact_message_for_review(m)
+        for m in sorted(
+            user_messages,
+            key=lambda msg: message_ts(msg) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+        )[-24:]
+    ]
+    prompt = (
+        "You are a cautious Discord moderation reviewer for a public community server.\n"
+        "A user crossed the volume threshold by posting many messages in 10 minutes.\n"
+        "Decide whether this flood is malicious enough to apply a 12-hour timeout.\n\n"
+        "Return ONLY compact JSON: {\"malicious\":true|false,\"reason\":\"short Japanese reason\"}\n\n"
+        "Mark malicious=true only for disruptive spam, harassment, repeated nuisance, obvious trolling, "
+        "mass mention abuse not already covered by rules, scam/solicitation flooding, or attachment/image flooding that disrupts conversation.\n"
+        "Mark malicious=false for normal active conversation, debugging/help exchanges, playful but harmless chatter, "
+        "legitimate multi-message explanations, or unclear cases. When unsure, choose false.\n\n"
+        f"Message count in 10 minutes: {len(user_messages)}\n"
+        "Messages JSON:\n"
+        f"{json.dumps(review_messages, ensure_ascii=False)}"
+    )
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You review Discord message floods conservatively. Output JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 120,
+    }
+    req = urllib.request.Request(
+        base_url + "/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": "nikechan-discord-autofreeze/1.1"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=int(ENV.get("DISCORD_AUTOFREEZE_LLM_TIMEOUT_SECONDS", "12"))) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        parsed = json_from_text(content)
+        return bool(parsed.get("malicious")), str(parsed.get("reason") or "")[:160]
+    except Exception as exc:
+        append_error(None, f"message flood LLM review failed: {exc}")
+        return False, "llm_error"
+
+
 def decide(messages: list[dict], now: dt.datetime) -> list[dict]:
     by_user: dict[str, list[dict]] = defaultdict(list)
     for msg in messages:
@@ -324,10 +453,15 @@ def decide(messages: list[dict], now: dt.datetime) -> list[dict]:
         )[-5:]
 
         if len(user_messages) >= MESSAGE_FLOOD_THRESHOLD:
-            reason = f"automated moderation: message flood ({len(user_messages)} messages in window)"
-        elif top_count >= DUPLICATE_THRESHOLD:
+            malicious, llm_reason = judge_message_flood_with_llm(user_messages)
+            if malicious:
+                reason = (
+                    "automated moderation: malicious message flood "
+                    f"({len(user_messages)} messages in window; llm={llm_reason or 'malicious'})"
+                )
+        if not reason and top_count >= DUPLICATE_THRESHOLD:
             reason = f"automated moderation: repeated duplicate message ({top_count} times)"
-        elif ai_nikechan_threshold > 0 and ai_nikechan_mentions >= ai_nikechan_threshold:
+        elif not reason and ai_nikechan_threshold > 0 and ai_nikechan_mentions >= ai_nikechan_threshold:
             reason = (
                 "automated moderation: ai nikechan mention spam outside dedicated channel "
                 f"({ai_nikechan_mentions} mentions in window)"
@@ -336,14 +470,14 @@ def decide(messages: list[dict], now: dt.datetime) -> list[dict]:
                 ai_nikechan_messages,
                 key=lambda m: message_ts(m) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
             )[-5:]
-        elif max_mentions >= MENTIONS_IN_ONE_MESSAGE_THRESHOLD:
+        elif not reason and max_mentions >= MENTIONS_IN_ONE_MESSAGE_THRESHOLD:
             reason = f"automated moderation: excessive mentions in one message ({max_mentions})"
-        elif total_mentions >= MENTIONS_TOTAL_THRESHOLD:
+        elif not reason and total_mentions >= MENTIONS_TOTAL_THRESHOLD:
             reason = f"automated moderation: excessive mentions in window ({total_mentions})"
-        elif solicitation_points >= 5 and "external_contact" in solicitation_signals:
+        elif not reason and solicitation_points >= 5 and "external_contact" in solicitation_signals:
             reason = "automated moderation: unsolicited external-contact business solicitation"
             evidence = [solicitation_message]
-        elif (
+        elif not reason and (
             solicitation_points >= 7
             and "crowdsourcing_engineer_profile" in solicitation_signals
             and "client_or_partner_seeking" in solicitation_signals
