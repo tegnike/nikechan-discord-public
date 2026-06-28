@@ -53,11 +53,17 @@ const MODEL = ENV.DISCORD_VOICE_GEMINI_MODEL || ENV.GEMINI_AUDIO_MODEL || "gemin
 const SESSION_DIR = path.resolve(PROFILE_DIR, ENV.DISCORD_VOICE_SESSION_DIR || "voice_sessions");
 const LANGUAGE = ENV.DISCORD_VOICE_LANGUAGE || "ja";
 const TRANSCRIPTION_ENABLED = boolEnv("DISCORD_VOICE_TRANSCRIPTION_ENABLED", true);
+const TRANSCRIBE_PROVIDER = (ENV.DISCORD_VOICE_TRANSCRIBE_PROVIDER || "local").trim().toLowerCase();
 const MAX_SESSION_SECONDS = intEnv("DISCORD_VOICE_MAX_SESSION_SECONDS", 30 * 60);
 const MAX_SESSION_CHUNKS = intEnv("DISCORD_VOICE_MAX_SESSION_CHUNKS", 250);
 const MAX_SESSION_AUDIO_BYTES = intEnv("DISCORD_VOICE_MAX_SESSION_AUDIO_BYTES", 20 * 1024 * 1024);
 const MIN_SESSION_AUDIO_BYTES = intEnv("DISCORD_VOICE_MIN_SESSION_AUDIO_BYTES", 8 * 1024);
 const FFMPEG_BIN = ENV.DISCORD_VOICE_FFMPEG_BIN || "ffmpeg";
+const LOCAL_WHISPER_BIN = ENV.DISCORD_VOICE_LOCAL_WHISPER_BIN || "";
+const LOCAL_WHISPER_MODEL = path.resolve(PROFILE_DIR, ENV.DISCORD_VOICE_LOCAL_WHISPER_MODEL || "models/whisper/ggml-large-v3-turbo.bin");
+const LOCAL_WHISPER_THREADS = intEnv("DISCORD_VOICE_LOCAL_WHISPER_THREADS", 4);
+const LOCAL_MAX_SESSION_SECONDS = intEnv("DISCORD_VOICE_LOCAL_MAX_SESSION_SECONDS", 3 * 60 * 60);
+const LOCAL_MAX_SESSION_CHUNKS = intEnv("DISCORD_VOICE_LOCAL_MAX_SESSION_CHUNKS", 10000);
 
 let client;
 let connection = null;
@@ -66,6 +72,7 @@ let startTimer = null;
 let stopTimer = null;
 let chunkSeq = 0;
 let geminiUnavailable = null;
+let localWhisperUnavailable = null;
 const activeUserStreams = new Set();
 
 function intEnv(name, fallback) {
@@ -357,19 +364,23 @@ async function transcribeSessionOnce(finalSession) {
     audioPath = await buildSessionAudio(finalSession, chunks);
     finalSession.sessionAudioPath = audioPath;
     finalSession.transcriptionStatus.rendered_audio_bytes = fileSize(audioPath);
-    if (finalSession.transcriptionStatus.rendered_audio_bytes > MAX_SESSION_AUDIO_BYTES) {
+    if (!isLocalProvider() && finalSession.transcriptionStatus.rendered_audio_bytes > MAX_SESSION_AUDIO_BYTES) {
       finalSession.transcriptionStatus.status = "skipped";
       finalSession.transcriptionStatus.reason = `rendered audio exceeds ${MAX_SESSION_AUDIO_BYTES} bytes`;
       log("skip session transcription", finalSession.transcriptionStatus);
       return;
     }
 
-    const parsed = await geminiTranscribeSession(audioPath, chunks);
+    const parsed = isLocalProvider()
+      ? await localWhisperTranscribeSession(finalSession, audioPath, chunks)
+      : await geminiTranscribeSession(audioPath, chunks);
     applyTranscriptionResult(finalSession, parsed, chunks);
     finalSession.transcriptionStatus.status = "completed";
+    finalSession.transcriptionStatus.provider = isLocalProvider() ? "local" : "gemini";
     finalSession.transcriptionStatus.transcript_count = finalSession.transcripts.length;
     log("session transcription completed", {
       session_id: finalSession.id,
+      provider: finalSession.transcriptionStatus.provider,
       chunks: chunks.length,
       transcripts: finalSession.transcripts.length,
       rendered_audio_bytes: finalSession.transcriptionStatus.rendered_audio_bytes,
@@ -379,6 +390,9 @@ async function transcribeSessionOnce(finalSession) {
     if (isFatalGeminiError(error)) {
       geminiUnavailable = { at: new Date().toISOString(), error };
       log("gemini transcription disabled until worker restart", { error });
+    } else if (isLocalProvider()) {
+      localWhisperUnavailable = { at: new Date().toISOString(), error };
+      log("local whisper transcription disabled until worker restart", { error });
     }
     finalSession.transcriptionStatus = { ...finalSession.transcriptionStatus, status: "failed", error };
     log("session transcription failed", { session_id: finalSession.id, error });
@@ -394,6 +408,15 @@ function usableChunks(targetSession) {
 function sessionSkipReason(chunks, durationMs, rawAudioBytes) {
   if (chunks.length === 0) return "no usable voice chunks";
   if (!TRANSCRIPTION_ENABLED) return "transcription disabled by DISCORD_VOICE_TRANSCRIPTION_ENABLED";
+  if (TRANSCRIBE_PROVIDER === "off" || TRANSCRIBE_PROVIDER === "none") return "transcription provider is off";
+  if (!["local", "whisper", "whisper-cpp", "gemini"].includes(TRANSCRIBE_PROVIDER)) return `unsupported transcription provider: ${TRANSCRIBE_PROVIDER}`;
+  if (isLocalProvider()) {
+    if (localWhisperUnavailable) return `local Whisper unavailable: ${localWhisperUnavailable.error}`;
+    if (!fs.existsSync(LOCAL_WHISPER_MODEL)) return `local Whisper model is missing: ${LOCAL_WHISPER_MODEL}`;
+    if (chunks.length > LOCAL_MAX_SESSION_CHUNKS) return `chunk count ${chunks.length} exceeds local limit ${LOCAL_MAX_SESSION_CHUNKS}`;
+    if (durationMs > LOCAL_MAX_SESSION_SECONDS * 1000) return `duration ${Math.round(durationMs / 1000)}s exceeds local limit ${LOCAL_MAX_SESSION_SECONDS}s`;
+    return null;
+  }
   if (!GEMINI_API_KEY) return "GEMINI_API_KEY is missing";
   if (geminiUnavailable) return `Gemini unavailable: ${geminiUnavailable.error}`;
   if (rawAudioBytes < MIN_SESSION_AUDIO_BYTES) return `session audio is under ${MIN_SESSION_AUDIO_BYTES} bytes`;
@@ -402,12 +425,16 @@ function sessionSkipReason(chunks, durationMs, rawAudioBytes) {
   return null;
 }
 
+function isLocalProvider() {
+  return ["local", "whisper", "whisper-cpp"].includes(TRANSCRIBE_PROVIDER);
+}
+
 async function buildSessionAudio(finalSession, chunks) {
   const listPath = path.join(finalSession.dir, "ffmpeg-concat.txt");
-  const outputPath = path.join(finalSession.dir, "session-audio.ogg");
+  const outputPath = path.join(finalSession.dir, isLocalProvider() ? "session-audio.wav" : "session-audio.ogg");
   const lines = chunks.map((chunk) => `file '${chunk.audio_path.replace(/'/g, "'\\''")}'`);
   fs.writeFileSync(listPath, `${lines.join("\n")}\n`);
-  await runCommand(FFMPEG_BIN, [
+  const commonArgs = [
     "-hide_banner",
     "-loglevel",
     "error",
@@ -423,12 +450,17 @@ async function buildSessionAudio(finalSession, chunks) {
     "1",
     "-ar",
     "16000",
+  ];
+  const encodeArgs = isLocalProvider()
+    ? ["-c:a", "pcm_s16le", outputPath]
+    : [
     "-c:a",
     "libopus",
     "-b:a",
     "24k",
     outputPath,
-  ]);
+  ];
+  await runCommand(FFMPEG_BIN, [...commonArgs, ...encodeArgs]);
   return outputPath;
 }
 
@@ -446,6 +478,92 @@ async function runCommand(command, args) {
       else reject(new Error(`${command} exited with ${code}: ${stderr.trim()}`));
     });
   });
+}
+
+async function runCommandCapture(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+      if (stdout.length > 200000) stdout = stdout.slice(-200000);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+      if (stderr.length > 8000) stderr = stderr.slice(-8000);
+    });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) resolve({ stdout, stderr });
+      else reject(new Error(`${command} exited with ${code}: ${stderr.trim() || stdout.trim()}`));
+    });
+  });
+}
+
+async function localWhisperTranscribeSession(finalSession, audioPath, chunks) {
+  const command = await resolveLocalWhisperCommand();
+  const outBase = path.join(finalSession.dir, "local-whisper");
+  const args = [
+    "-m",
+    LOCAL_WHISPER_MODEL,
+    "-f",
+    audioPath,
+    "-l",
+    LANGUAGE,
+    "-t",
+    String(LOCAL_WHISPER_THREADS),
+    "-otxt",
+    "-of",
+    outBase,
+    "-nt",
+    "-np",
+  ];
+  const { stdout } = await runCommandCapture(command, args);
+  const txtPath = `${outBase}.txt`;
+  const rawText = fs.existsSync(txtPath) ? fs.readFileSync(txtPath, "utf8") : stdout;
+  const text = normalizeWhisperText(rawText);
+  const durationMs = Math.max(0, ...(chunks.map((chunk) => chunk.end_ms)), 0);
+  return {
+    segments: [{
+      seq: chunks[0]?.seq || 1,
+      start_ms: 0,
+      end_ms: durationMs,
+      speaker: "VC",
+      text: text || "[inaudible]",
+    }],
+    summary_markdown: [
+      "ローカルWhisperで文字起こしを生成しました。",
+      "クラウドAPIは使用していません。",
+      "要約は生成していません。添付のtranscript.mdを確認してください。",
+    ].join("\n"),
+  };
+}
+
+async function resolveLocalWhisperCommand() {
+  const candidates = [
+    LOCAL_WHISPER_BIN,
+    "whisper-cli",
+    "whisper-cpp",
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      await runCommandCapture(candidate, ["--help"]);
+      return candidate;
+    } catch {
+      // Try the next known binary name.
+    }
+  }
+  throw new Error("local Whisper command not found; install whisper-cpp or set DISCORD_VOICE_LOCAL_WHISPER_BIN");
+}
+
+function normalizeWhisperText(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
 }
 
 async function geminiTranscribeSession(audioPath, chunks) {
@@ -550,7 +668,9 @@ function summaryForStatus(status, finalSession) {
       "VC音声は保存しましたが、API送信はスキップしました。",
       `理由: ${status.reason}`,
       `保存先: ${finalSession.sessionAudioPath || path.join(finalSession.dir, "audio")}`,
-      "長時間VCや大量チャンクはコスト暴走防止のため自動送信しません。",
+      isLocalProvider()
+        ? "ローカルWhisperの前提が不足しているため、クラウドAPIにはフォールバックしていません。"
+        : "長時間VCや大量チャンクはコスト暴走防止のため自動送信しません。",
     ].join("\n");
   }
   if (status.status === "failed") {
@@ -721,9 +841,13 @@ async function main() {
       voice_channel_id: VOICE_CHANNEL_ID,
       summary_channel_id: SUMMARY_CHANNEL_ID,
       transcription_enabled: TRANSCRIPTION_ENABLED,
+      transcribe_provider: TRANSCRIBE_PROVIDER,
+      local_whisper_model: LOCAL_WHISPER_MODEL,
       max_session_seconds: MAX_SESSION_SECONDS,
       max_session_chunks: MAX_SESSION_CHUNKS,
       max_session_audio_bytes: MAX_SESSION_AUDIO_BYTES,
+      local_max_session_seconds: LOCAL_MAX_SESSION_SECONDS,
+      local_max_session_chunks: LOCAL_MAX_SESSION_CHUNKS,
     });
     await evaluateVoiceState("ready");
   });

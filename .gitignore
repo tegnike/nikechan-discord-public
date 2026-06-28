@@ -26,6 +26,7 @@ cache/
 audio_cache/
 voice_sessions/
 image_cache/
+models/whisper/*.bin
 pairing/
 plans/
 sandboxes/

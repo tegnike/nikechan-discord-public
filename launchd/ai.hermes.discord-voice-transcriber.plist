@@ -32,6 +32,16 @@
     <string>30</string>
     <key>DISCORD_VOICE_END_GRACE_SECONDS</key>
     <string>30</string>
+    <key>DISCORD_VOICE_TRANSCRIBE_PROVIDER</key>
+    <string>local</string>
+    <key>DISCORD_VOICE_LOCAL_WHISPER_MODEL</key>
+    <string>models/whisper/ggml-large-v3-turbo.bin</string>
+    <key>DISCORD_VOICE_LOCAL_WHISPER_THREADS</key>
+    <string>4</string>
+    <key>DISCORD_VOICE_LOCAL_MAX_SESSION_SECONDS</key>
+    <string>10800</string>
+    <key>DISCORD_VOICE_LOCAL_MAX_SESSION_CHUNKS</key>
+    <string>10000</string>
     <key>DISCORD_VOICE_MAX_SESSION_SECONDS</key>
     <string>1800</string>
     <key>DISCORD_VOICE_MAX_SESSION_CHUNKS</key>
