@@ -32,6 +32,14 @@
     <string>30</string>
     <key>DISCORD_VOICE_END_GRACE_SECONDS</key>
     <string>30</string>
+    <key>DISCORD_VOICE_MAX_SESSION_SECONDS</key>
+    <string>1800</string>
+    <key>DISCORD_VOICE_MAX_SESSION_CHUNKS</key>
+    <string>250</string>
+    <key>DISCORD_VOICE_MAX_SESSION_AUDIO_BYTES</key>
+    <string>20971520</string>
+    <key>DISCORD_VOICE_MIN_SESSION_AUDIO_BYTES</key>
+    <string>8192</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
