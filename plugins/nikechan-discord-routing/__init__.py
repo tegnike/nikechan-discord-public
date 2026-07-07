@@ -504,6 +504,13 @@ def _truncate(value: Any, limit: int) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
+# 書き込みはDB側ロール権限（nikechan_discord_bot）と二重で制限する
+_SUPABASE_WRITE_ALLOWLIST = (
+    ("PATCH", "users"),          # nickname更新（列権限はDB側でnickname/updated_atのみ）
+    ("POST", "contact_episodes"),  # nickname変更エピソード記録
+)
+
+
 def _supabase_request(
     path: str,
     env: dict[str, str],
@@ -511,16 +518,20 @@ def _supabase_request(
     method: str = "GET",
     body: dict[str, Any] | None = None,
 ) -> Any:
-    if method.upper() != "GET":
-        logger.warning(
-            "nikechan-discord-routing blocked non-GET supabase request: %s %s",
-            method,
-            path.split("?")[0],
-        )
-        return None
+    m = method.upper()
+    if m != "GET":
+        resource = path.split("?")[0].strip("/")
+        if (m, resource) not in _SUPABASE_WRITE_ALLOWLIST:
+            logger.warning(
+                "nikechan-discord-routing blocked non-allowlisted supabase request: %s %s",
+                method,
+                resource,
+            )
+            return None
     url = env.get("SUPABASE_URL")
     key = (
-        env.get("SUPABASE_SERVICE_ROLE_KEY")
+        env.get("SUPABASE_DISCORD_BOT_KEY")
+        or env.get("SUPABASE_SERVICE_ROLE_KEY")
         or env.get("SUPABASE_PUBLIC_READ_KEY")
         or env.get("SUPABASE_ANON_KEY")
     )
@@ -528,7 +539,7 @@ def _supabase_request(
         return None
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     headers = {
-        "apikey": key,
+        "apikey": env.get("SUPABASE_ANON_KEY") or key,
         "Authorization": f"Bearer {key}",
         "Accept": "application/json",
     }

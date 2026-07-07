@@ -47,7 +47,7 @@ def json_out(payload: dict) -> None:
 
 def supabase_request(method: str, endpoint: str, body: dict | None = None):
     url = (ENV.get("SUPABASE_URL") or "").rstrip("/")
-    key = ENV.get("SUPABASE_SERVICE_ROLE_KEY") or ENV.get("SUPABASE_ANON_KEY") or ""
+    key = ENV.get("SUPABASE_DISCORD_BOT_KEY") or ENV.get("SUPABASE_SERVICE_ROLE_KEY") or ENV.get("SUPABASE_ANON_KEY") or ""
     if not url or not key:
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required")
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
@@ -56,7 +56,7 @@ def supabase_request(method: str, endpoint: str, body: dict | None = None):
         data=data,
         method=method,
         headers={
-            "apikey": key,
+            "apikey": ENV.get("SUPABASE_ANON_KEY") or key,
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
             "Prefer": "return=representation",
