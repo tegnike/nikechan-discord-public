@@ -809,7 +809,8 @@ def _person_context_for_event(event: Any) -> str | None:
             episode_limit = max(0, min(_config_int("person_context_recent_episodes", 3), 5))
             uid = urllib.parse.quote(str(user_id), safe="")
             episodes = _supabase_request(
-                f"contact_episodes?user_id=eq.{uid}&order=occurred_at.desc&limit={episode_limit}"
+                f"contact_episodes?user_id=eq.{uid}&event_type=neq.observation"
+                f"&order=occurred_at.desc&limit={episode_limit}"
                 "&select=content,source,event_type,occurred_at",
                 env,
             ) or []
