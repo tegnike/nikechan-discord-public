@@ -511,6 +511,13 @@ def _supabase_request(
     method: str = "GET",
     body: dict[str, Any] | None = None,
 ) -> Any:
+    if method.upper() != "GET":
+        logger.warning(
+            "nikechan-discord-routing blocked non-GET supabase request: %s %s",
+            method,
+            path.split("?")[0],
+        )
+        return None
     url = env.get("SUPABASE_URL")
     key = (
         env.get("SUPABASE_SERVICE_ROLE_KEY")

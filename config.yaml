@@ -75,6 +75,7 @@ skills:
       - debugging-hermes-tui-commands
       - design-md
       - discord-freeze
+      - discord-todo
       - dogfood
       - dspy
       - evaluating-llms-harness
@@ -265,6 +266,7 @@ discord:
   should_reply_fast_path_confidence: 0.95
   route_intent_llm_timeout_seconds: 15
   should_reply_context_messages: 5
+  nickname_update: false
   person_context: true
   person_context_recent_episodes: 3
   person_context_cache_seconds: 300
