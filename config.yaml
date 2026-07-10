@@ -213,6 +213,7 @@ platform_toolsets:
     - hermes-telegram
   discord:
     - web
+    - skills_readonly
   whatsapp:
     - hermes-whatsapp
   slack:
