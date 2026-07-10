@@ -6,12 +6,16 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 DISCORD_EPOCH_MS = 1420070400000
 API = "https://discord.com/api/v10"
+SUPABASE_RPC_TIMEOUT_SECONDS = 10
+DISCORD_API_MAX_PAGES = 50
+DISCORD_API_MAX_SECONDS = 20
 QUERY_DROP_PHRASES = (
     "について",
     "に関して",
@@ -49,6 +53,7 @@ def load_env() -> dict:
     if env.get("HERMES_HOME"):
         homes.append(Path(env["HERMES_HOME"]))
     homes.append(Path.home() / ".hermes")
+    homes.append(Path.home() / "WorkSpace" / "nikechan")
     for home in homes:
         p = home / ".env"
         if not p.exists():
@@ -63,6 +68,9 @@ def load_env() -> dict:
 
 ENV = load_env()
 TOKEN = ENV.get("DISCORD_BOT_TOKEN", "").strip()
+SUPABASE_URL = ENV.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_ANON_KEY = ENV.get("SUPABASE_ANON_KEY", "").strip()
+SUPABASE_BOT_KEY = ENV.get("SUPABASE_DISCORD_BOT_KEY", "").strip()
 ALLOWED_GUILDS = {
     g.strip()
     for g in ENV.get("DISCORD_ALLOWED_GUILDS", "").split(",")
@@ -72,6 +80,41 @@ ALLOWED_GUILDS = {
 
 class DiscordError(RuntimeError):
     pass
+
+
+def supabase_rpc(name: str, payload: dict):
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY or not SUPABASE_BOT_KEY:
+        raise DiscordError(
+            "Discord history DB is not configured. "
+            "SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_DISCORD_BOT_KEY are required."
+        )
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/rpc/{name}",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_BOT_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "nikechan-hermes-discord-history/2.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=SUPABASE_RPC_TIMEOUT_SECONDS) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise DiscordError("Discord history DB returned invalid JSON") from exc
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = (json.loads(body) or {}).get("message") or "request rejected"
+        except Exception:
+            detail = "request rejected"
+        raise DiscordError(f"Discord history DB HTTP {exc.code}: {detail}") from exc
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        raise DiscordError(f"Discord history DB unavailable: {type(exc).__name__}") from exc
 
 
 def request(method: str, path: str, params: dict | None = None, body: dict | None = None):
@@ -275,29 +318,32 @@ def normalize_message(msg: dict, guild_id: str | None, channel_id: str) -> dict:
     }
 
 
-def fetch_messages(channel: str, guild_id: str | None, start: dt.datetime | None, end: dt.datetime | None, limit: int):
+def fetch_messages_api(channel: str, guild_id: str | None, start: dt.datetime | None, end: dt.datetime | None, limit: int):
     ch = resolve_channel(channel, guild_id)
     channel_id = ch["id"]
-    after = snowflake_from_time(start) if start else None
     before = snowflake_from_time(end) if end else None
     out = []
     seen = set()
-    while len(out) < limit:
+    pages = 0
+    stop_reason = "complete"
+    deadline = time.monotonic() + DISCORD_API_MAX_SECONDS
+    while len(out) < limit and pages < DISCORD_API_MAX_PAGES and time.monotonic() < deadline:
         batch_limit = min(100, limit - len(out))
         params = {"limit": str(batch_limit)}
         if before:
             params["before"] = before
-        if after:
-            params["after"] = after
         batch = request("GET", f"/channels/{channel_id}/messages", params=params)
+        pages += 1
         if not batch:
             break
         stop = False
+        new_ids = 0
         for msg in batch:
             mid = msg["id"]
             if mid in seen:
                 continue
             seen.add(mid)
+            new_ids += 1
             ts = parse_time(msg.get("timestamp"))
             if start and ts and ts < start:
                 stop = True
@@ -306,12 +352,29 @@ def fetch_messages(channel: str, guild_id: str | None, start: dt.datetime | None
                 continue
             out.append(normalize_message(msg, ch.get("guild_id"), channel_id))
         oldest = min(batch, key=lambda m: int(m["id"]))["id"]
+        if oldest == before or new_ids == 0:
+            stop_reason = "no_progress"
+            break
         before = oldest
         if stop or len(batch) < batch_limit:
             break
         time.sleep(0.05)
+    else:
+        if pages >= DISCORD_API_MAX_PAGES:
+            stop_reason = "page_limit"
+        elif time.monotonic() >= deadline:
+            stop_reason = "time_limit"
     out.sort(key=lambda m: m["timestamp"] or "")
-    return {"channel": ch, "from": iso(start) if start else None, "to": iso(end) if end else None, "count": len(out), "messages": out}
+    return {
+        "source": "discord_api_bounded_fallback",
+        "channel": ch,
+        "from": iso(start) if start else None,
+        "to": iso(end) if end else None,
+        "count": len(out),
+        "pages": pages,
+        "stop_reason": stop_reason,
+        "messages": out,
+    }
 
 
 def fetch_message(channel: str, message_id: str, guild_id: str | None):
@@ -324,10 +387,155 @@ def fetch_message(channel: str, message_id: str, guild_id: str | None):
     }
 
 
+def normalize_db_message(row: dict, guild_id: str) -> dict:
+    author_name = row.get("author_name") or "unknown"
+    channel_id = str(row.get("channel_id") or "")
+    return {
+        "id": row.get("message_id"),
+        "timestamp": row.get("message_at"),
+        "author": {
+            "username": author_name,
+            "display_name": author_name,
+        },
+        "content": row.get("content_snippet") or "",
+        "attachment_count": int(row.get("attachment_count") or 0),
+        "reply_to_message_id": row.get("reply_to_message_id"),
+        "channel": {
+            "id": channel_id,
+            "name": row.get("channel_name"),
+            "guild_id": guild_id,
+        },
+        "jump_url": row.get("jump_url"),
+    }
+
+
+def resolve_db_channel(channel: str, guild_id: str | None) -> dict:
+    raw = channel.strip()
+    raw = raw[2:-1] if raw.startswith("<#") and raw.endswith(">") else raw
+    if raw.isdigit():
+        resolved_guild = guild_id
+        if not resolved_guild and len(ALLOWED_GUILDS) == 1:
+            resolved_guild = next(iter(ALLOWED_GUILDS))
+        assert_allowed_guild(resolved_guild, f"channel {raw}")
+        return {
+            "id": raw,
+            "name": None,
+            "guild_id": resolved_guild,
+            "type": 0,
+        }
+
+    ch = resolve_channel(channel, guild_id)
+    resolved_guild = str(ch.get("guild_id") or guild_id or "")
+    assert_allowed_guild(resolved_guild, f"channel {ch.get('id')}")
+    return ch
+
+
+def db_fetch_messages(
+    channel: str,
+    guild_id: str | None,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    limit: int,
+):
+    ch = resolve_db_channel(channel, guild_id)
+    resolved_guild = str(ch.get("guild_id") or guild_id or "")
+    rows = supabase_rpc(
+        "fetch_discord_history_v2",
+        {
+            "p_guild_id": resolved_guild,
+            "p_channel_ids": [str(ch["id"])],
+            "p_from": iso(start) if start else None,
+            "p_to": iso(end) if end else None,
+            "p_sort": "desc",
+            "p_limit": min(max(limit, 1), 200),
+        },
+    )
+    messages = [normalize_db_message(row, resolved_guild) for row in rows]
+    messages.sort(key=lambda item: item.get("timestamp") or "")
+    return {
+        "source": "supabase_history_db",
+        "channel": ch,
+        "from": iso(start) if start else None,
+        "to": iso(end) if end else None,
+        "count": len(messages),
+        "messages": messages,
+    }
+
+
+def db_search_messages(
+    channel: str,
+    guild_id: str | None,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    queries: list[str],
+    result_limit: int,
+    sort: str,
+):
+    ch = resolve_db_channel(channel, guild_id)
+    resolved_guild = str(ch.get("guild_id") or guild_id or "")
+    payload = {
+        "p_guild_id": resolved_guild,
+        "p_channel_ids": [str(ch["id"])],
+        "p_queries": queries[:5],
+        "p_from": iso(start) if start else None,
+        "p_to": iso(end) if end else None,
+        "p_sort": sort,
+        "p_limit": min(max(result_limit, 1), 30),
+    }
+    rows = supabase_rpc("search_discord_history_v2", payload)
+    summaries = []
+    summary_error = None
+    summaries_skipped_reason = None
+    if sort == "asc":
+        # The summary RPC is newest-first. Mixing it into an oldest-first
+        # response makes the result chronologically misleading, so the exact
+        # message result is the whole budget for deep-history requests.
+        summaries_skipped_reason = "oldest_first_exact_messages_only"
+    else:
+        try:
+            summaries = supabase_rpc(
+                "search_discord_summaries_v2",
+                {
+                    "p_guild_id": resolved_guild,
+                    "p_channel_ids": [str(ch["id"])],
+                    "p_queries": queries[:5],
+                    "p_from": iso(start) if start else None,
+                    "p_to": iso(end) if end else None,
+                    "p_limit": 12,
+                },
+            )
+        except DiscordError as exc:
+            # Summaries are optional context. Preserve valid exact-message
+            # evidence when their independent RPC fails.
+            summary_error = str(exc)
+    results = [normalize_db_message(row, resolved_guild) for row in rows]
+    return {
+        "source": "supabase_history_db",
+        "channel": ch,
+        "from": iso(start) if start else None,
+        "to": iso(end) if end else None,
+        "query": queries[0],
+        "query_terms": query_terms(queries[0]),
+        "alternate_queries": queries[1:],
+        "result_count": len(results),
+        "summary_result_count": len(summaries),
+        "summary_error": summary_error,
+        "summaries_skipped_reason": summaries_skipped_reason,
+        "results": results,
+        "summary_results": summaries,
+    }
+
+
 def cmd_fetch(args):
     start = parse_time(args.from_time)
     end = parse_time(args.to_time)
-    print(json.dumps(fetch_messages(args.channel, args.guild, start, end, args.limit), ensure_ascii=False, indent=2))
+    print(json.dumps(db_fetch_messages(args.channel, args.guild, start, end, args.limit), ensure_ascii=False, indent=2))
+
+
+def cmd_fetch_api(args):
+    start = parse_time(args.from_time)
+    end = parse_time(args.to_time)
+    print(json.dumps(fetch_messages_api(args.channel, args.guild, start, end, args.limit), ensure_ascii=False, indent=2))
 
 
 def cmd_fetch_message(args):
@@ -337,86 +545,23 @@ def cmd_fetch_message(args):
 def cmd_search(args):
     start = parse_time(args.from_time)
     end = parse_time(args.to_time)
-    data = fetch_messages(args.channel, args.guild, start, end, args.limit)
     queries = unique_preserve_order([args.query] + list(args.alternate_query or []))
-    terms = query_terms(args.query)
-    term_groups = query_term_groups(queries)
-    results = []
-    for msg in data["messages"]:
-        hay = " ".join([
-            msg.get("content") or "",
-            msg["author"].get("username") or "",
-            msg["author"].get("display_name") or "",
-            " ".join(a.get("filename") or "" for a in msg.get("attachments", [])),
-            " ".join(e.get("title") or "" for e in msg.get("embeds", [])),
-        ]).lower()
-        if message_matches(hay, queries, term_groups):
-            results.append(msg)
-    data["query"] = args.query
-    data["query_terms"] = terms
-    data["alternate_queries"] = queries[1:]
-    data["query_term_groups"] = term_groups
-    data["results"] = results[: args.result_limit]
-    data["result_count"] = len(data["results"])
-    data.pop("messages", None)
+    data = db_search_messages(
+        args.channel,
+        args.guild,
+        start,
+        end,
+        queries,
+        args.result_limit,
+        args.sort,
+    )
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def cmd_search_guild(args):
-    guild_id = args.guild
-    assert_allowed_guild(guild_id, "requested guild")
-    start = parse_time(args.from_time)
-    end = parse_time(args.to_time)
-    queries = unique_preserve_order([args.query] + list(args.alternate_query or []))
-    terms = query_terms(args.query)
-    term_groups = query_term_groups(queries)
-    results = []
-    errors = []
-    scanned_channels = 0
-    scanned_messages = 0
-
-    for ch in list_channels(guild_id):
-        if ch.get("type") not in (0, 5):
-            continue
-        scanned_channels += 1
-        try:
-            data = fetch_messages(ch["id"], guild_id, start, end, args.limit_per_channel)
-        except Exception as exc:
-            errors.append({"channel_id": ch.get("id"), "channel_name": ch.get("name"), "error": str(exc)})
-            continue
-        scanned_messages += data.get("count", 0)
-        for msg in data["messages"]:
-            hay = " ".join([
-                msg.get("content") or "",
-                msg["author"].get("username") or "",
-                msg["author"].get("display_name") or "",
-                " ".join(a.get("filename") or "" for a in msg.get("attachments", [])),
-                " ".join(e.get("title") or "" for e in msg.get("embeds", [])),
-                " ".join(e.get("description") or "" for e in msg.get("embeds", [])),
-            ]).lower()
-            if message_matches(hay, queries, term_groups):
-                msg["channel"] = data["channel"]
-                results.append(msg)
-
-    results.sort(key=lambda m: m.get("timestamp") or "")
-    print(json.dumps(
-        {
-            "guild_id": guild_id,
-            "from": iso(start) if start else None,
-            "to": iso(end) if end else None,
-            "query": args.query,
-            "query_terms": terms,
-            "alternate_queries": queries[1:],
-            "query_term_groups": term_groups,
-            "scanned_channels": scanned_channels,
-            "scanned_messages": scanned_messages,
-            "result_count_total": len(results),
-            "results": results[: args.result_limit],
-            "errors": errors[:20],
-        },
-        ensure_ascii=False,
-        indent=2,
-    ))
+    raise DiscordError(
+        "Server-wide history search is disabled. Specify one channel so the bounded DB RPC can enforce scope."
+    )
 
 
 def cmd_list_channels(args):
@@ -439,19 +584,22 @@ def cmd_list_channels(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fetch/search Discord message history safely for Hermes skills.")
+    parser = argparse.ArgumentParser(
+        description="Fetch/search the bounded Supabase Discord history archive for Hermes skills."
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("fetch", "search"):
+    for name in ("fetch", "fetch-api", "search"):
         p = sub.add_parser(name)
         p.add_argument("--channel", required=True, help="Channel id, <#id>, or #name")
         p.add_argument("--guild", help="Guild id; required only for ambiguous #names")
         p.add_argument("--from", dest="from_time", help="UTC or offset ISO timestamp/date")
         p.add_argument("--to", dest="to_time", help="UTC or offset ISO timestamp/date")
-        p.add_argument("--limit", type=int, default=300, help="Maximum messages to scan/fetch")
+        p.add_argument("--limit", type=int, default=200, help="Maximum messages to return")
         if name == "search":
             p.add_argument("--query", required=True)
             p.add_argument("--alternate-query", action="append", default=[])
             p.add_argument("--result-limit", type=int, default=30)
+            p.add_argument("--sort", choices=("asc", "desc"), default="desc")
     p = sub.add_parser("search-guild")
     p.add_argument("--guild", required=True, help="Guild id to search. Must be in DISCORD_ALLOWED_GUILDS.")
     p.add_argument("--from", dest="from_time", help="UTC or offset ISO timestamp/date")
@@ -470,6 +618,8 @@ def main():
     try:
         if args.cmd == "fetch":
             cmd_fetch(args)
+        elif args.cmd == "fetch-api":
+            cmd_fetch_api(args)
         elif args.cmd == "fetch-message":
             cmd_fetch_message(args)
         elif args.cmd == "search":
