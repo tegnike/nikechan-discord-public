@@ -169,10 +169,65 @@ class DiscordRoutingHistoryTests(unittest.TestCase):
         self.assertIn("[NIKECHAN_REFERENCED_IMAGE_REQUEST]", result["text"])
         self.assertNotIn("[REFERENCE_IMAGE_REQUEST]", result["text"])
 
+    def test_nikechan_and_attached_character_use_both_references(self):
+        png = bytes.fromhex(
+            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+            "890000000d49444154789c6300010000000500010d0a2db40000000049454e44"
+            "ae426082"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "image_cache"
+            assets = root / "assets"
+            cache.mkdir()
+            assets.mkdir()
+            attached = cache / "attached-girl.png"
+            official = assets / "nikechan-model-sheet.png"
+            attached.write_bytes(png)
+            official.write_bytes(png)
+            event = discord_event(
+                text="この添付画像の女の子とAIニケちゃんが遊んでいる画像を作成して",
+                media_urls=[str(attached)],
+                media_types=["image/png"],
+            )
+            with (
+                mock.patch.object(routing, "_profile_root", return_value=root),
+                mock.patch.object(
+                    routing,
+                    "_generate_with_references",
+                    return_value={"success": True, "delivery": "MEDIA:/tmp/result.png"},
+                ) as generate,
+            ):
+                routed = routing._rewrite(event)
+                self.assertIsNotNone(routed)
+                self.assertIn("[NIKECHAN_MIXED_REFERENCE_IMAGE_REQUEST]", routed["text"])
+                token_match = re.search(r"reference_token: (\S+)", routed["text"])
+                self.assertIsNotNone(token_match)
+                result = routing.json.loads(
+                    routing._nikechan_with_reference_generate(
+                        {
+                            "prompt": event.text,
+                            "reference_token": token_match.group(1),
+                            "aspect_ratio": "landscape",
+                        }
+                    )
+                )
+
+            self.assertTrue(result["success"])
+            references = generate.call_args.args[2]
+            self.assertEqual(references, [attached.resolve(), official.resolve()])
+            self.assertEqual(result["attached_reference_count"], 1)
+            self.assertEqual(result["nikechan_reference_used"], str(official.resolve()))
+
     def test_reference_tool_schema_never_accepts_a_file_path(self):
         properties = routing.REFERENCE_IMAGE_SCHEMA["parameters"]["properties"]
         self.assertEqual(
             set(properties),
+            {"prompt", "reference_token", "aspect_ratio"},
+        )
+        mixed_properties = routing.NIKECHAN_MIXED_IMAGE_SCHEMA["parameters"]["properties"]
+        self.assertEqual(
+            set(mixed_properties),
             {"prompt", "reference_token", "aspect_ratio"},
         )
 

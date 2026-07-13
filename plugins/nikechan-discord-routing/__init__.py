@@ -156,6 +156,36 @@ REFERENCE_IMAGE_SCHEMA = {
         "required": ["prompt", "reference_token"],
     },
 }
+NIKECHAN_MIXED_IMAGE_TOOL_NAME = "nikechan_with_reference_generate"
+NIKECHAN_MIXED_IMAGE_SCHEMA = {
+    "name": NIKECHAN_MIXED_IMAGE_TOOL_NAME,
+    "description": (
+        "Generate an illustration containing both AI Nikechan and character(s) from image "
+        "attachments in the current Discord request. The tool combines the opaque attachment "
+        "reference token with AI Nikechan's fixed official model sheet. Use this instead of "
+        "nikechan_image_generate or reference_image_generate for mixed-character requests. "
+        "After success, include the returned delivery value verbatim in the final response."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "The requested interaction, scene, poses, expressions, composition, and style.",
+            },
+            "reference_token": {
+                "type": "string",
+                "description": "Opaque token supplied by the internal mixed-reference routing block.",
+            },
+            "aspect_ratio": {
+                "type": "string",
+                "enum": ["landscape", "square", "portrait"],
+                "default": "landscape",
+            },
+        },
+        "required": ["prompt", "reference_token"],
+    },
+}
 REFERENCE_IMAGE_TOKEN_TTL_SECONDS = 15 * 60
 REFERENCE_IMAGE_MAX_CONTEXTS = 64
 REFERENCE_IMAGE_MAX_FILES = 4
@@ -304,6 +334,22 @@ def _general_reference_prompt(user_prompt: str) -> str:
         "Follow the requested scene, pose, expression, composition, and style without copying "
         "the original background or layout unless the user explicitly asks for it. Do not output "
         "a model sheet, labels, or comparison panels.\n\n"
+        f"User request: {user_prompt.strip()}"
+    )
+
+
+def _nikechan_mixed_reference_prompt(user_prompt: str, attached_count: int) -> str:
+    return (
+        f"Create one polished illustration containing AI Nikechan together with the character "
+        f"or characters shown in the first {attached_count} attached reference image(s). "
+        "The final attached reference image is AI Nikechan's official three-view model sheet. "
+        "Keep the identities distinct and preserve the recognizable face, hair, colors, clothing, "
+        "and accessories of every referenced character. For AI Nikechan specifically preserve her "
+        "purple ponytail, gold AI hairpin, brown eyes, teal-blue AITuber T-shirt, oversized "
+        "light-blue hoodie with large pink polka dots, white shorts, and purple sneakers. "
+        "Show all requested characters interacting naturally in one coherent scene. Do not output "
+        "a model sheet, labels, split comparison panels, or duplicate either character unless the "
+        "user explicitly requests duplicates.\n\n"
         f"User request: {user_prompt.strip()}"
     )
 
@@ -467,6 +513,40 @@ def _reference_image_generate(args: dict[str, Any], **_kwargs: Any) -> str:
         return json.dumps(result, ensure_ascii=False)
     except Exception as exc:
         logger.exception("Discord referenced image generation failed")
+        return json.dumps(
+            {"success": False, "error": str(exc)[:500]},
+            ensure_ascii=False,
+        )
+
+
+def _nikechan_with_reference_generate(args: dict[str, Any], **_kwargs: Any) -> str:
+    prompt = str(args.get("prompt") or "").strip()
+    reference_token = str(args.get("reference_token") or "").strip()
+    if not prompt:
+        return json.dumps({"success": False, "error": "prompt is required"})
+    attached_references = _resolve_reference_context(reference_token)
+    if not attached_references:
+        return json.dumps(
+            {"success": False, "error": "reference token is invalid or expired"}
+        )
+    try:
+        nikechan_reference = _nikechan_reference_path().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return json.dumps(
+            {"success": False, "error": "official AI Nikechan model sheet is unavailable"}
+        )
+    try:
+        result = _generate_with_references(
+            _nikechan_mixed_reference_prompt(prompt, len(attached_references)),
+            str(args.get("aspect_ratio") or "landscape"),
+            [*attached_references, nikechan_reference],
+            prefix="nikechan_mixed_reference",
+        )
+        result["attached_reference_count"] = len(attached_references)
+        result["nikechan_reference_used"] = str(nikechan_reference)
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        logger.exception("AI Nikechan mixed-reference image generation failed")
         return json.dumps(
             {"success": False, "error": str(exc)[:500]},
             ensure_ascii=False,
@@ -3190,6 +3270,32 @@ def _rewrite_nikechan_image_request(text: str, _event: Any) -> dict[str, str] | 
     }
 
 
+def _rewrite_nikechan_mixed_image_request(text: str, event: Any) -> dict[str, str] | None:
+    if not NIKECHAN_IMAGE_INTENT_RE.search(text):
+        return None
+    if not NIKECHAN_IMAGE_SUBJECT_RE.search(text):
+        return None
+    attached_references = _safe_inbound_reference_paths(event)
+    if not attached_references:
+        return None
+    reference_token = _register_reference_context(attached_references)
+    return {
+        "action": "rewrite",
+        "text": (
+            "[NIKECHAN_MIXED_REFERENCE_IMAGE_REQUEST]\n"
+            f"元の依頼: {text}\n"
+            f"reference_token: {reference_token}\n"
+            f"Discord添付参照画像数: {len(attached_references)}\n\n"
+            "これはDiscord添付画像のキャラクターとAIニケちゃんを同じ画像へ生成する混合依頼です。"
+            "必ず nikechan_with_reference_generate を呼び出してください。"
+            "この専用ツールは不透明トークンのDiscord添付画像と、AIニケちゃん公式三面図の両方を"
+            "実画像として画像APIへ渡します。他の画像生成ツールは使わないでください。"
+            "成功後はツール結果の delivery にある MEDIA:/absolute/path.png を"
+            "最終応答へそのまま含め、Discordへ画像を添付してください。"
+        ),
+    }
+
+
 def _rewrite_reference_image_request(text: str, event: Any) -> dict[str, str] | None:
     if not NIKECHAN_IMAGE_INTENT_RE.search(text):
         return None
@@ -3218,6 +3324,10 @@ def _rewrite(event: Any) -> dict[str, str] | None:
     if not isinstance(text, str):
         return None
     text = _visible_user_text(text)
+
+    routed = _rewrite_nikechan_mixed_image_request(text, event)
+    if routed:
+        return routed
 
     routed = _rewrite_nikechan_image_request(text, event)
     if routed:
@@ -3328,6 +3438,14 @@ def register(ctx):
         handler=_reference_image_generate,
         check_fn=_reference_image_requirements,
         emoji="🖼️",
+    )
+    ctx.register_tool(
+        name=NIKECHAN_MIXED_IMAGE_TOOL_NAME,
+        toolset=NIKECHAN_IMAGE_TOOLSET,
+        schema=NIKECHAN_MIXED_IMAGE_SCHEMA,
+        handler=_nikechan_with_reference_generate,
+        check_fn=_nikechan_image_requirements,
+        emoji="👭",
     )
 
     def hook(event=None, session_store=None, **_kwargs):
