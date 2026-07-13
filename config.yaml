@@ -217,6 +217,7 @@ platform_toolsets:
     - web
     - skills_readonly
     - image_gen
+    - nikechan_image_gen
   whatsapp:
     - hermes-whatsapp
   slack:

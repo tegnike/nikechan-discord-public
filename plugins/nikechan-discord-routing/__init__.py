@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import hashlib
+import importlib
 import json
 import logging
 import os
@@ -84,6 +87,43 @@ NICKNAME_FORBIDDEN_RE = re.compile(
     r"(マスター|master|admin|administrator|owner|root|管理者|nikechan|ニケちゃん|aiニケ|ＡＩニケ)",
     re.I,
 )
+NIKECHAN_IMAGE_INTENT_RE = re.compile(
+    r"(自画像|描いて|描け|生成して|生成お願い|作って|作成して|作成お願い|"
+    r"(?:画像|イラスト|絵|立ち絵|アイコン|壁紙).{0,12}(?:お願い|ほしい|欲しい|ください))",
+    re.I,
+)
+NIKECHAN_IMAGE_SUBJECT_RE = re.compile(
+    r"(AI\s*ニケちゃん|AI\s*ニケ|ＡＩ\s*ニケちゃん|ＡＩ\s*ニケ|ニケちゃん|自画像|あなた(?:自身)?|自分(?:自身)?)",
+    re.I,
+)
+NIKECHAN_IMAGE_TOOLSET = "nikechan_image_gen"
+NIKECHAN_IMAGE_TOOL_NAME = "nikechan_image_generate"
+NIKECHAN_REFERENCE_RELATIVE_PATH = Path("assets/nikechan-model-sheet.png")
+NIKECHAN_IMAGE_SCHEMA = {
+    "name": NIKECHAN_IMAGE_TOOL_NAME,
+    "description": (
+        "Generate an illustration or self-portrait of AI Nikechan using the fixed official "
+        "three-view model sheet as an actual image reference. Use this instead of "
+        "image_generate whenever the subject is AI Nikechan. The reference path is fixed "
+        "and cannot be supplied by users. After success, include the returned delivery "
+        "value (MEDIA:/absolute/path.png) verbatim in the final response."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "The requested scene, pose, expression, composition, and style.",
+            },
+            "aspect_ratio": {
+                "type": "string",
+                "enum": ["landscape", "square", "portrait"],
+                "default": "square",
+            },
+        },
+        "required": ["prompt"],
+    },
+}
 
 
 def _visible_user_text(text: str) -> str:
@@ -97,6 +137,131 @@ def _home() -> Path:
 
 def _profile_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _nikechan_reference_path() -> Path:
+    return _profile_root() / NIKECHAN_REFERENCE_RELATIVE_PATH
+
+
+def _nikechan_image_backend():
+    return importlib.import_module("plugins.image_gen.openai-codex")
+
+
+def _nikechan_image_requirements() -> bool:
+    reference = _nikechan_reference_path()
+    if not reference.is_file():
+        logger.error("AI Nikechan model sheet is missing: %s", reference)
+        return False
+    try:
+        backend = _nikechan_image_backend()
+        return bool(backend._read_codex_access_token())
+    except Exception as exc:
+        logger.warning("AI Nikechan image backend is unavailable: %s", exc)
+        return False
+
+
+def _nikechan_image_prompt(user_prompt: str) -> str:
+    return (
+        "Create one polished illustration of AI Nikechan. Use the attached official "
+        "three-view model sheet as the identity and appearance reference, not as a layout "
+        "to reproduce. Preserve her invariant design: purple ponytail, gold AI hairpin, "
+        "brown eyes, teal-blue AITuber T-shirt, oversized light-blue hoodie with large pink "
+        "polka dots, white shorts, and purple sneakers. Keep the character recognizable and "
+        "do not replace, omit, recolor, or redesign those identity features. Produce a single "
+        "coherent scene without model-sheet panels, labels, or turnaround guides.\n\n"
+        f"User request: {user_prompt.strip()}"
+    )
+
+
+def _nikechan_image_generate(args: dict[str, Any], **_kwargs: Any) -> str:
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return json.dumps({"success": False, "error": "prompt is required"})
+
+    reference = _nikechan_reference_path()
+    if not reference.is_file():
+        return json.dumps(
+            {"success": False, "error": "official AI Nikechan model sheet is unavailable"}
+        )
+
+    try:
+        import httpx
+        from agent.auxiliary_client import _codex_cloudflare_headers
+
+        backend = _nikechan_image_backend()
+        token = backend._read_codex_access_token()
+        if not token:
+            return json.dumps(
+                {"success": False, "error": "Codex OAuth authentication is unavailable"}
+            )
+
+        aspect_ratio = backend.resolve_aspect_ratio(args.get("aspect_ratio") or "square")
+        model_id, model_meta = backend._resolve_model()
+        size = backend._SIZES.get(aspect_ratio, backend._SIZES["square"])
+        payload = backend._build_responses_payload(
+            prompt=_nikechan_image_prompt(prompt),
+            size=size,
+            quality=model_meta["quality"],
+        )
+        reference_b64 = base64.b64encode(reference.read_bytes()).decode("ascii")
+        payload["input"][0]["content"].append(
+            {
+                "type": "input_image",
+                "image_url": f"data:image/png;base64,{reference_b64}",
+            }
+        )
+
+        headers = _codex_cloudflare_headers(token)
+        headers.update(
+            {
+                "Accept": "text/event-stream",
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+        )
+        timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
+        generated_b64 = None
+        with httpx.Client(timeout=timeout, headers=headers) as http:
+            with http.stream(
+                "POST",
+                f"{backend._CODEX_BASE_URL}/responses",
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                for stream_event in backend._iter_sse_json(response):
+                    found = backend._extract_image_b64(stream_event)
+                    if found:
+                        generated_b64 = found
+
+        if not generated_b64:
+            return json.dumps(
+                {"success": False, "error": "image generation returned no image"}
+            )
+
+        image_path = backend.save_b64_image(
+            generated_b64,
+            prefix="nikechan_reference",
+        )
+        reference_sha256 = hashlib.sha256(reference.read_bytes()).hexdigest()
+        return json.dumps(
+            {
+                "success": True,
+                "image": str(image_path),
+                "delivery": f"MEDIA:{image_path}",
+                "provider": "openai-codex",
+                "model": model_id,
+                "aspect_ratio": aspect_ratio,
+                "reference_used": str(reference),
+                "reference_sha256": reference_sha256,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        logger.exception("AI Nikechan referenced image generation failed")
+        return json.dumps(
+            {"success": False, "error": str(exc)[:500]},
+            ensure_ascii=False,
+        )
 
 
 def _helper(name: str) -> Path:
@@ -2796,11 +2961,35 @@ def _rewrite_skill_list_request(text: str, event: Any) -> dict[str, str] | None:
     )
     return {"action": "rewrite", "text": rewritten}
 
+
+def _rewrite_nikechan_image_request(text: str, _event: Any) -> dict[str, str] | None:
+    if not NIKECHAN_IMAGE_INTENT_RE.search(text):
+        return None
+    if not NIKECHAN_IMAGE_SUBJECT_RE.search(text):
+        return None
+    return {
+        "action": "rewrite",
+        "text": (
+            "[NIKECHAN_REFERENCED_IMAGE_REQUEST]\n"
+            f"元の依頼: {text}\n\n"
+            "これはAIニケちゃん本人のイラストまたは自画像の生成依頼です。"
+            "通常の image_generate は使わず、必ず nikechan_image_generate を呼び出してください。"
+            "この専用ツールは公式三面図を実画像として固定参照します。"
+            "成功後はツール結果の delivery にある MEDIA:/absolute/path.png を"
+            "最終応答へそのまま含め、Discordへ画像を添付してください。"
+        ),
+    }
+
+
 def _rewrite(event: Any) -> dict[str, str] | None:
     text = getattr(event, "text", "") or ""
     if not isinstance(text, str):
         return None
     text = _visible_user_text(text)
+
+    routed = _rewrite_nikechan_image_request(text, event)
+    if routed:
+        return routed
 
     routed = _rewrite_discord_message_url(text, event)
     if routed:
@@ -2888,6 +3077,15 @@ def _rewrite(event: Any) -> dict[str, str] | None:
 
 
 def register(ctx):
+    ctx.register_tool(
+        name=NIKECHAN_IMAGE_TOOL_NAME,
+        toolset=NIKECHAN_IMAGE_TOOLSET,
+        schema=NIKECHAN_IMAGE_SCHEMA,
+        handler=_nikechan_image_generate,
+        check_fn=_nikechan_image_requirements,
+        emoji="🎨",
+    )
+
     def hook(event=None, session_store=None, **_kwargs):
         if event is None:
             return None
