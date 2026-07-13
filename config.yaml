@@ -3,6 +3,9 @@ model:
   provider: openai-codex
   base_url: https://chatgpt.com/backend-api/codex
   api_mode: codex_responses
+image_gen:
+  provider: openai-codex
+  model: gpt-image-2-medium
 terminal:
   backend: local
   cwd: /Users/nikenike/.hermes/profiles/nikechan-discord-public/workspace
@@ -156,7 +159,6 @@ agent:
     - delegation
     - messaging
     - todo
-    - image_gen
     - vision
     - video
     - tts
@@ -214,6 +216,7 @@ platform_toolsets:
   discord:
     - web
     - skills_readonly
+    - image_gen
   whatsapp:
     - hermes-whatsapp
   slack:
