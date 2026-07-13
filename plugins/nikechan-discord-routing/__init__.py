@@ -88,15 +88,6 @@ NICKNAME_FORBIDDEN_RE = re.compile(
     r"(マスター|master|admin|administrator|owner|root|管理者|nikechan|ニケちゃん|aiニケ|ＡＩニケ)",
     re.I,
 )
-NIKECHAN_IMAGE_INTENT_RE = re.compile(
-    r"(自画像|描いて|描け|生成して|生成お願い|作って|作成して|作成お願い|"
-    r"(?:画像|イラスト|絵|立ち絵|アイコン|壁紙).{0,12}(?:お願い|ほしい|欲しい|ください))",
-    re.I,
-)
-NIKECHAN_IMAGE_SUBJECT_RE = re.compile(
-    r"(AI\s*ニケちゃん|AI\s*ニケ|ＡＩ\s*ニケちゃん|ＡＩ\s*ニケ|ニケちゃん|自画像|あなた(?:自身)?|自分(?:自身)?)",
-    re.I,
-)
 NIKECHAN_IMAGE_TOOLSET = "nikechan_image_gen"
 NIKECHAN_IMAGE_TOOL_NAME = "nikechan_image_generate"
 NIKECHAN_REFERENCE_RELATIVE_PATH = Path("assets/nikechan-model-sheet.png")
@@ -352,6 +343,45 @@ def _nikechan_mixed_reference_prompt(user_prompt: str, attached_count: int) -> s
         "user explicitly requests duplicates.\n\n"
         f"User request: {user_prompt.strip()}"
     )
+
+
+def _with_image_generation_policy(text: str, event: Any) -> str:
+    """Give the agent reference capabilities; let the agent decide intent semantically."""
+    references = _safe_inbound_reference_paths(event)
+    lines = [
+        "[IMAGE_GENERATION_SEMANTIC_POLICY]",
+        "画像生成意図と被写体は、ユーザーの自然な言い方と会話文脈を理解してLLM自身が判断してください。",
+        "キーワード、正規表現、定型句への一致だけで判断してはいけません。",
+        "- AIニケちゃん本人を描く依頼なら nikechan_image_generate を使い、公式三面図を実画像参照にする。",
+        "- 添付画像を使わない一般的な画像生成だけ image_generate を使ってよい。",
+        "- 画像の説明、感想、質問など生成依頼でない場合は画像生成ツールを呼ばない。",
+    ]
+    if references:
+        reference_token = _register_reference_context(references)
+        lines.extend(
+            [
+                f"reference_token: {reference_token}",
+                f"current_discord_attachment_reference_count: {len(references)}",
+                "現在のDiscord添付画像は、上記の不透明トークンを通じて生成APIへ実画像参照として渡せます。",
+                "- 生成・編集結果が添付画像の人物、キャラクター、物、構図、デザインに依存する依頼なら、必ず reference_image_generate を使う。",
+                "- 添付画像の被写体とAIニケちゃんを同じ生成画像へ出す依頼なら、必ず nikechan_with_reference_generate を使う。",
+                "- 添付画像に依存する生成で image_generate を使ってはいけない。画像を文章で説明して代用してはいけない。",
+                "reference_token には上記トークンだけを渡し、ファイルパスを渡してはいけません。",
+            ]
+        )
+        logger.info(
+            "nikechan-discord-routing image references exposed to agent LLM: count=%d",
+            len(references),
+        )
+    else:
+        lines.append("current_discord_attachment_reference_count: 0")
+    lines.extend(
+        [
+            "成功後は専用ツール結果の delivery にある MEDIA:/absolute/path.png を最終応答へそのまま含める。",
+            "[/IMAGE_GENERATION_SEMANTIC_POLICY]",
+        ]
+    )
+    return "\n".join(lines) + "\n\n" + text
 
 
 def _generate_with_references(
@@ -3251,91 +3281,11 @@ def _rewrite_skill_list_request(text: str, event: Any) -> dict[str, str] | None:
     return {"action": "rewrite", "text": rewritten}
 
 
-def _rewrite_nikechan_image_request(text: str, _event: Any) -> dict[str, str] | None:
-    if not NIKECHAN_IMAGE_INTENT_RE.search(text):
-        return None
-    if not NIKECHAN_IMAGE_SUBJECT_RE.search(text):
-        return None
-    return {
-        "action": "rewrite",
-        "text": (
-            "[NIKECHAN_REFERENCED_IMAGE_REQUEST]\n"
-            f"元の依頼: {text}\n\n"
-            "これはAIニケちゃん本人のイラストまたは自画像の生成依頼です。"
-            "通常の image_generate は使わず、必ず nikechan_image_generate を呼び出してください。"
-            "この専用ツールは公式三面図を実画像として固定参照します。"
-            "成功後はツール結果の delivery にある MEDIA:/absolute/path.png を"
-            "最終応答へそのまま含め、Discordへ画像を添付してください。"
-        ),
-    }
-
-
-def _rewrite_nikechan_mixed_image_request(text: str, event: Any) -> dict[str, str] | None:
-    if not NIKECHAN_IMAGE_INTENT_RE.search(text):
-        return None
-    if not NIKECHAN_IMAGE_SUBJECT_RE.search(text):
-        return None
-    attached_references = _safe_inbound_reference_paths(event)
-    if not attached_references:
-        return None
-    reference_token = _register_reference_context(attached_references)
-    return {
-        "action": "rewrite",
-        "text": (
-            "[NIKECHAN_MIXED_REFERENCE_IMAGE_REQUEST]\n"
-            f"元の依頼: {text}\n"
-            f"reference_token: {reference_token}\n"
-            f"Discord添付参照画像数: {len(attached_references)}\n\n"
-            "これはDiscord添付画像のキャラクターとAIニケちゃんを同じ画像へ生成する混合依頼です。"
-            "必ず nikechan_with_reference_generate を呼び出してください。"
-            "この専用ツールは不透明トークンのDiscord添付画像と、AIニケちゃん公式三面図の両方を"
-            "実画像として画像APIへ渡します。他の画像生成ツールは使わないでください。"
-            "成功後はツール結果の delivery にある MEDIA:/absolute/path.png を"
-            "最終応答へそのまま含め、Discordへ画像を添付してください。"
-        ),
-    }
-
-
-def _rewrite_reference_image_request(text: str, event: Any) -> dict[str, str] | None:
-    if not NIKECHAN_IMAGE_INTENT_RE.search(text):
-        return None
-    references = _safe_inbound_reference_paths(event)
-    if not references:
-        return None
-    reference_token = _register_reference_context(references)
-    return {
-        "action": "rewrite",
-        "text": (
-            "[REFERENCE_IMAGE_REQUEST]\n"
-            f"元の依頼: {text}\n"
-            f"reference_token: {reference_token}\n"
-            f"参照画像数: {len(references)}\n\n"
-            "これは現在のDiscordメッセージに添付された画像を実画像参照として使う生成依頼です。"
-            "通常の image_generate は使わず、必ず reference_image_generate を呼び出してください。"
-            "reference_token には上記の不透明トークンだけを渡し、ファイルパスは渡さないでください。"
-            "成功後はツール結果の delivery にある MEDIA:/absolute/path.png を"
-            "最終応答へそのまま含め、Discordへ画像を添付してください。"
-        ),
-    }
-
-
 def _rewrite(event: Any) -> dict[str, str] | None:
     text = getattr(event, "text", "") or ""
     if not isinstance(text, str):
         return None
     text = _visible_user_text(text)
-
-    routed = _rewrite_nikechan_mixed_image_request(text, event)
-    if routed:
-        return routed
-
-    routed = _rewrite_nikechan_image_request(text, event)
-    if routed:
-        return routed
-
-    routed = _rewrite_reference_image_request(text, event)
-    if routed:
-        return routed
 
     routed = _rewrite_discord_message_url(text, event)
     if routed:
@@ -3482,6 +3432,7 @@ def register(ctx):
                 return {"action": "skip", "reason": "should_reply_false"}
         if attachment_text:
             rewritten = _with_person_context(attachment_text, event)
+            rewritten = _with_image_generation_policy(rewritten, event)
             _remember_recent_message(event, attachment_text)
             return {"action": "rewrite", "text": rewritten}
         routed = _rewrite(event)
@@ -3491,6 +3442,7 @@ def register(ctx):
             return routed
         if isinstance(text, str):
             contextualized = _with_person_context(text, event)
+            contextualized = _with_image_generation_policy(contextualized, event)
             if contextualized != text:
                 _remember_recent_message(event)
                 return {"action": "rewrite", "text": contextualized}

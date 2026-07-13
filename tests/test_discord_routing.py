@@ -117,7 +117,7 @@ class DiscordRoutingHistoryTests(unittest.TestCase):
         self.assertEqual(parsed["timeout_seconds"], 20)
         self.assertIn("タイムアウト", parsed["error"])
 
-    def test_attached_character_image_routes_with_opaque_reference_token(self):
+    def test_attached_character_image_exposes_opaque_reference_token_to_agent_llm(self):
         png = bytes.fromhex(
             "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
             "890000000d49444154789c6300010000000500010d0a2db40000000049454e44"
@@ -135,14 +135,14 @@ class DiscordRoutingHistoryTests(unittest.TestCase):
                 media_types=["image/png"],
             )
             with mock.patch.object(routing, "_profile_root", return_value=root):
-                result = routing._rewrite(event)
-                token_match = re.search(r"reference_token: (\S+)", result["text"])
+                rewritten = routing._with_image_generation_policy(event.text, event)
+                token_match = re.search(r"reference_token: (\S+)", rewritten)
                 self.assertIsNotNone(token_match)
                 resolved = routing._resolve_reference_context(token_match.group(1))
 
-            self.assertIsNotNone(result)
-            self.assertIn("[REFERENCE_IMAGE_REQUEST]", result["text"])
-            self.assertNotIn(str(reference), result["text"])
+            self.assertIn("[IMAGE_GENERATION_SEMANTIC_POLICY]", rewritten)
+            self.assertIn("LLM自身が判断", rewritten)
+            self.assertNotIn(str(reference), rewritten)
             self.assertEqual(resolved, [reference.resolve()])
 
     def test_attached_reference_rejects_paths_outside_profile_cache(self):
@@ -158,16 +158,78 @@ class DiscordRoutingHistoryTests(unittest.TestCase):
                 media_types=["image/png"],
             )
             with mock.patch.object(routing, "_profile_root", return_value=profile):
-                result = routing._rewrite_reference_image_request(event.text, event)
+                rewritten = routing._with_image_generation_policy(event.text, event)
 
-            self.assertIsNone(result)
+            self.assertIn("current_discord_attachment_reference_count: 0", rewritten)
+            self.assertNotIn("reference_token:", rewritten)
 
-    def test_nikechan_requests_keep_official_model_sheet_priority(self):
+    def test_nikechan_image_intent_is_left_to_agent_llm(self):
         event = discord_event(text="AIニケちゃんの自画像を作って")
-        result = routing._rewrite(event)
-        self.assertIsNotNone(result)
-        self.assertIn("[NIKECHAN_REFERENCED_IMAGE_REQUEST]", result["text"])
-        self.assertNotIn("[REFERENCE_IMAGE_REQUEST]", result["text"])
+        self.assertIsNone(routing._rewrite(event))
+        rewritten = routing._with_image_generation_policy(event.text, event)
+        self.assertIn("LLM自身が判断", rewritten)
+        self.assertIn("nikechan_image_generate", rewritten)
+
+    def test_reference_intent_phrasing_is_not_classified_by_regex(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+        phrases = [
+            "じゃあ今度はこの子をホラー映像に写した画像を",
+            "このコを使って雰囲気を変えたやつ出して",
+            "この画像を参照して別の場面にして",
+            "この子が海辺にいたらどんな感じ？絵で見たい",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "image_cache"
+            cache.mkdir()
+            reference = cache / "attached.png"
+            reference.write_bytes(png)
+            with mock.patch.object(routing, "_profile_root", return_value=root):
+                for phrase in phrases:
+                    with self.subTest(phrase=phrase):
+                        event = discord_event(
+                            text=phrase,
+                            media_urls=[str(reference)],
+                            media_types=["image/png"],
+                        )
+                        self.assertIsNone(routing._rewrite(event))
+                        rewritten = routing._with_image_generation_policy(phrase, event)
+                        self.assertIn("reference_token:", rewritten)
+                        self.assertIn("LLM自身が判断", rewritten)
+
+    def test_gateway_hook_gives_attached_request_to_agent_llm(self):
+        class FakePluginContext:
+            def register_tool(self, **_kwargs):
+                pass
+
+            def register_hook(self, _name, hook):
+                self.hook = hook
+
+        png = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "image_cache"
+            cache.mkdir()
+            reference = cache / "attached.png"
+            reference.write_bytes(png)
+            event = discord_event(
+                text="じゃあ今度はこの子をホラー映像に写した画像を",
+                media_urls=[str(reference)],
+                media_types=["image/png"],
+            )
+            ctx = FakePluginContext()
+            routing.register(ctx)
+            with (
+                mock.patch.object(routing, "_profile_root", return_value=root),
+                mock.patch.object(routing, "_config_bool", return_value=False),
+                mock.patch.object(routing, "_with_person_context", side_effect=lambda text, _event: text),
+            ):
+                result = ctx.hook(event=event)
+
+        self.assertEqual(result["action"], "rewrite")
+        self.assertIn("[IMAGE_GENERATION_SEMANTIC_POLICY]", result["text"])
+        self.assertIn("reference_token:", result["text"])
+        self.assertIn(event.text, result["text"])
 
     def test_nikechan_and_attached_character_use_both_references(self):
         png = bytes.fromhex(
@@ -198,10 +260,8 @@ class DiscordRoutingHistoryTests(unittest.TestCase):
                     return_value={"success": True, "delivery": "MEDIA:/tmp/result.png"},
                 ) as generate,
             ):
-                routed = routing._rewrite(event)
-                self.assertIsNotNone(routed)
-                self.assertIn("[NIKECHAN_MIXED_REFERENCE_IMAGE_REQUEST]", routed["text"])
-                token_match = re.search(r"reference_token: (\S+)", routed["text"])
+                rewritten = routing._with_image_generation_policy(event.text, event)
+                token_match = re.search(r"reference_token: (\S+)", rewritten)
                 self.assertIsNotNone(token_match)
                 result = routing.json.loads(
                     routing._nikechan_with_reference_generate(
