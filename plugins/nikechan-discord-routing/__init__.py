@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -124,6 +125,43 @@ NIKECHAN_IMAGE_SCHEMA = {
         "required": ["prompt"],
     },
 }
+REFERENCE_IMAGE_TOOL_NAME = "reference_image_generate"
+REFERENCE_IMAGE_SCHEMA = {
+    "name": REFERENCE_IMAGE_TOOL_NAME,
+    "description": (
+        "Generate a new illustration using image attachments from the current Discord "
+        "request as actual visual references. Use this when the user asks to draw, restyle, "
+        "or create a scene featuring a character in an attached image. reference_token must "
+        "come from the internal REFERENCE_IMAGE_REQUEST block; never invent one and never "
+        "accept a file path. After success, include the returned delivery value "
+        "(MEDIA:/absolute/path.png) verbatim in the final response."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "The requested scene, pose, expression, composition, and style.",
+            },
+            "reference_token": {
+                "type": "string",
+                "description": "Opaque token supplied by the internal routing block for this request.",
+            },
+            "aspect_ratio": {
+                "type": "string",
+                "enum": ["landscape", "square", "portrait"],
+                "default": "square",
+            },
+        },
+        "required": ["prompt", "reference_token"],
+    },
+}
+REFERENCE_IMAGE_TOKEN_TTL_SECONDS = 15 * 60
+REFERENCE_IMAGE_MAX_CONTEXTS = 64
+REFERENCE_IMAGE_MAX_FILES = 4
+REFERENCE_IMAGE_MAX_TOTAL_BYTES = 25 * 1024 * 1024
+_REFERENCE_IMAGE_CONTEXTS: dict[str, tuple[float, tuple[str, ...]]] = {}
+_REFERENCE_IMAGE_CONTEXT_LOCK = threading.Lock()
 
 
 def _visible_user_text(text: str) -> str:
@@ -145,6 +183,205 @@ def _nikechan_reference_path() -> Path:
 
 def _nikechan_image_backend():
     return importlib.import_module("plugins.image_gen.openai-codex")
+
+
+def _image_mime_type(path: Path) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(16)
+    except OSError:
+        return None
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _safe_inbound_reference_paths(event: Any) -> list[Path]:
+    profile = _profile_root().resolve()
+    allowed_roots = [
+        (profile / "image_cache").resolve(),
+        (profile / "cache" / "images").resolve(),
+    ]
+    selected: list[Path] = []
+    total_bytes = 0
+    for raw_value in list(getattr(event, "media_urls", None) or []):
+        raw = str(raw_value or "").strip()
+        if not raw:
+            continue
+        if raw.startswith("file://"):
+            parsed = urllib.parse.urlparse(raw)
+            raw = urllib.parse.unquote(parsed.path)
+        try:
+            path = Path(raw).expanduser().resolve(strict=True)
+            size = path.stat().st_size
+        except (OSError, RuntimeError):
+            continue
+        if not any(_path_is_within(path, root) for root in allowed_roots):
+            continue
+        if size <= 0 or total_bytes + size > REFERENCE_IMAGE_MAX_TOTAL_BYTES:
+            continue
+        if _image_mime_type(path) is None:
+            continue
+        selected.append(path)
+        total_bytes += size
+        if len(selected) >= REFERENCE_IMAGE_MAX_FILES:
+            break
+    return selected
+
+
+def _register_reference_context(paths: list[Path]) -> str:
+    now = time.monotonic()
+    expires_at = now + REFERENCE_IMAGE_TOKEN_TTL_SECONDS
+    token = secrets.token_urlsafe(24)
+    with _REFERENCE_IMAGE_CONTEXT_LOCK:
+        expired = [
+            key for key, (expiry, _paths) in _REFERENCE_IMAGE_CONTEXTS.items()
+            if expiry <= now
+        ]
+        for key in expired:
+            _REFERENCE_IMAGE_CONTEXTS.pop(key, None)
+        while len(_REFERENCE_IMAGE_CONTEXTS) >= REFERENCE_IMAGE_MAX_CONTEXTS:
+            oldest = min(_REFERENCE_IMAGE_CONTEXTS, key=lambda key: _REFERENCE_IMAGE_CONTEXTS[key][0])
+            _REFERENCE_IMAGE_CONTEXTS.pop(oldest, None)
+        _REFERENCE_IMAGE_CONTEXTS[token] = (expires_at, tuple(str(path) for path in paths))
+    return token
+
+
+def _resolve_reference_context(token: str) -> list[Path]:
+    value = str(token or "").strip()
+    if not value or len(value) > 128:
+        return []
+    now = time.monotonic()
+    with _REFERENCE_IMAGE_CONTEXT_LOCK:
+        item = _REFERENCE_IMAGE_CONTEXTS.get(value)
+        if not item:
+            return []
+        expires_at, raw_paths = item
+        if expires_at <= now:
+            _REFERENCE_IMAGE_CONTEXTS.pop(value, None)
+            return []
+    profile = _profile_root().resolve()
+    allowed_roots = [
+        (profile / "image_cache").resolve(),
+        (profile / "cache" / "images").resolve(),
+    ]
+    resolved: list[Path] = []
+    total_bytes = 0
+    for raw_path in raw_paths:
+        try:
+            path = Path(raw_path).resolve(strict=True)
+            size = path.stat().st_size
+        except (OSError, RuntimeError):
+            return []
+        if not any(_path_is_within(path, root) for root in allowed_roots):
+            return []
+        if size <= 0 or total_bytes + size > REFERENCE_IMAGE_MAX_TOTAL_BYTES:
+            return []
+        if _image_mime_type(path) is None:
+            return []
+        resolved.append(path)
+        total_bytes += size
+    return resolved
+
+
+def _general_reference_prompt(user_prompt: str) -> str:
+    return (
+        "Create one polished illustration using the attached image or images as the primary "
+        "visual reference for the character identity and design. Preserve recognizable facial "
+        "features, hairstyle, colors, clothing, accessories, and other identity-defining details. "
+        "Follow the requested scene, pose, expression, composition, and style without copying "
+        "the original background or layout unless the user explicitly asks for it. Do not output "
+        "a model sheet, labels, or comparison panels.\n\n"
+        f"User request: {user_prompt.strip()}"
+    )
+
+
+def _generate_with_references(
+    prompt: str,
+    aspect_ratio: str,
+    references: list[Path],
+    *,
+    prefix: str,
+) -> dict[str, Any]:
+    import httpx
+    from agent.auxiliary_client import _codex_cloudflare_headers
+
+    backend = _nikechan_image_backend()
+    token = backend._read_codex_access_token()
+    if not token:
+        return {"success": False, "error": "Codex OAuth authentication is unavailable"}
+
+    normalized_aspect_ratio = backend.resolve_aspect_ratio(aspect_ratio or "square")
+    model_id, model_meta = backend._resolve_model()
+    size = backend._SIZES.get(normalized_aspect_ratio, backend._SIZES["square"])
+    payload = backend._build_responses_payload(
+        prompt=prompt,
+        size=size,
+        quality=model_meta["quality"],
+    )
+    reference_hashes: list[str] = []
+    for reference in references:
+        raw = reference.read_bytes()
+        mime_type = _image_mime_type(reference)
+        if not mime_type:
+            return {"success": False, "error": "reference image format is unsupported"}
+        reference_hashes.append(hashlib.sha256(raw).hexdigest())
+        reference_b64 = base64.b64encode(raw).decode("ascii")
+        payload["input"][0]["content"].append(
+            {
+                "type": "input_image",
+                "image_url": f"data:{mime_type};base64,{reference_b64}",
+            }
+        )
+
+    headers = _codex_cloudflare_headers(token)
+    headers.update(
+        {
+            "Accept": "text/event-stream",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+    )
+    timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
+    generated_b64 = None
+    with httpx.Client(timeout=timeout, headers=headers) as http:
+        with http.stream(
+            "POST",
+            f"{backend._CODEX_BASE_URL}/responses",
+            json=payload,
+        ) as response:
+            response.raise_for_status()
+            for stream_event in backend._iter_sse_json(response):
+                found = backend._extract_image_b64(stream_event)
+                if found:
+                    generated_b64 = found
+
+    if not generated_b64:
+        return {"success": False, "error": "image generation returned no image"}
+
+    image_path = backend.save_b64_image(generated_b64, prefix=prefix)
+    return {
+        "success": True,
+        "image": str(image_path),
+        "delivery": f"MEDIA:{image_path}",
+        "provider": "openai-codex",
+        "model": model_id,
+        "aspect_ratio": normalized_aspect_ratio,
+        "reference_count": len(references),
+        "reference_sha256": reference_hashes,
+    }
 
 
 def _nikechan_image_requirements() -> bool:
@@ -185,79 +422,51 @@ def _nikechan_image_generate(args: dict[str, Any], **_kwargs: Any) -> str:
         )
 
     try:
-        import httpx
-        from agent.auxiliary_client import _codex_cloudflare_headers
-
-        backend = _nikechan_image_backend()
-        token = backend._read_codex_access_token()
-        if not token:
-            return json.dumps(
-                {"success": False, "error": "Codex OAuth authentication is unavailable"}
-            )
-
-        aspect_ratio = backend.resolve_aspect_ratio(args.get("aspect_ratio") or "square")
-        model_id, model_meta = backend._resolve_model()
-        size = backend._SIZES.get(aspect_ratio, backend._SIZES["square"])
-        payload = backend._build_responses_payload(
-            prompt=_nikechan_image_prompt(prompt),
-            size=size,
-            quality=model_meta["quality"],
-        )
-        reference_b64 = base64.b64encode(reference.read_bytes()).decode("ascii")
-        payload["input"][0]["content"].append(
-            {
-                "type": "input_image",
-                "image_url": f"data:image/png;base64,{reference_b64}",
-            }
-        )
-
-        headers = _codex_cloudflare_headers(token)
-        headers.update(
-            {
-                "Accept": "text/event-stream",
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            }
-        )
-        timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
-        generated_b64 = None
-        with httpx.Client(timeout=timeout, headers=headers) as http:
-            with http.stream(
-                "POST",
-                f"{backend._CODEX_BASE_URL}/responses",
-                json=payload,
-            ) as response:
-                response.raise_for_status()
-                for stream_event in backend._iter_sse_json(response):
-                    found = backend._extract_image_b64(stream_event)
-                    if found:
-                        generated_b64 = found
-
-        if not generated_b64:
-            return json.dumps(
-                {"success": False, "error": "image generation returned no image"}
-            )
-
-        image_path = backend.save_b64_image(
-            generated_b64,
+        result = _generate_with_references(
+            _nikechan_image_prompt(prompt),
+            str(args.get("aspect_ratio") or "square"),
+            [reference],
             prefix="nikechan_reference",
         )
-        reference_sha256 = hashlib.sha256(reference.read_bytes()).hexdigest()
-        return json.dumps(
-            {
-                "success": True,
-                "image": str(image_path),
-                "delivery": f"MEDIA:{image_path}",
-                "provider": "openai-codex",
-                "model": model_id,
-                "aspect_ratio": aspect_ratio,
-                "reference_used": str(reference),
-                "reference_sha256": reference_sha256,
-            },
-            ensure_ascii=False,
-        )
+        result["reference_used"] = str(reference)
+        return json.dumps(result, ensure_ascii=False)
     except Exception as exc:
         logger.exception("AI Nikechan referenced image generation failed")
+        return json.dumps(
+            {"success": False, "error": str(exc)[:500]},
+            ensure_ascii=False,
+        )
+
+
+def _reference_image_requirements() -> bool:
+    try:
+        backend = _nikechan_image_backend()
+        return bool(backend._read_codex_access_token())
+    except Exception as exc:
+        logger.warning("Referenced image backend is unavailable: %s", exc)
+        return False
+
+
+def _reference_image_generate(args: dict[str, Any], **_kwargs: Any) -> str:
+    prompt = str(args.get("prompt") or "").strip()
+    reference_token = str(args.get("reference_token") or "").strip()
+    if not prompt:
+        return json.dumps({"success": False, "error": "prompt is required"})
+    references = _resolve_reference_context(reference_token)
+    if not references:
+        return json.dumps(
+            {"success": False, "error": "reference token is invalid or expired"}
+        )
+    try:
+        result = _generate_with_references(
+            _general_reference_prompt(prompt),
+            str(args.get("aspect_ratio") or "square"),
+            references,
+            prefix="discord_reference",
+        )
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        logger.exception("Discord referenced image generation failed")
         return json.dumps(
             {"success": False, "error": str(exc)[:500]},
             ensure_ascii=False,
@@ -2981,6 +3190,29 @@ def _rewrite_nikechan_image_request(text: str, _event: Any) -> dict[str, str] | 
     }
 
 
+def _rewrite_reference_image_request(text: str, event: Any) -> dict[str, str] | None:
+    if not NIKECHAN_IMAGE_INTENT_RE.search(text):
+        return None
+    references = _safe_inbound_reference_paths(event)
+    if not references:
+        return None
+    reference_token = _register_reference_context(references)
+    return {
+        "action": "rewrite",
+        "text": (
+            "[REFERENCE_IMAGE_REQUEST]\n"
+            f"元の依頼: {text}\n"
+            f"reference_token: {reference_token}\n"
+            f"参照画像数: {len(references)}\n\n"
+            "これは現在のDiscordメッセージに添付された画像を実画像参照として使う生成依頼です。"
+            "通常の image_generate は使わず、必ず reference_image_generate を呼び出してください。"
+            "reference_token には上記の不透明トークンだけを渡し、ファイルパスは渡さないでください。"
+            "成功後はツール結果の delivery にある MEDIA:/absolute/path.png を"
+            "最終応答へそのまま含め、Discordへ画像を添付してください。"
+        ),
+    }
+
+
 def _rewrite(event: Any) -> dict[str, str] | None:
     text = getattr(event, "text", "") or ""
     if not isinstance(text, str):
@@ -2988,6 +3220,10 @@ def _rewrite(event: Any) -> dict[str, str] | None:
     text = _visible_user_text(text)
 
     routed = _rewrite_nikechan_image_request(text, event)
+    if routed:
+        return routed
+
+    routed = _rewrite_reference_image_request(text, event)
     if routed:
         return routed
 
@@ -3084,6 +3320,14 @@ def register(ctx):
         handler=_nikechan_image_generate,
         check_fn=_nikechan_image_requirements,
         emoji="🎨",
+    )
+    ctx.register_tool(
+        name=REFERENCE_IMAGE_TOOL_NAME,
+        toolset=NIKECHAN_IMAGE_TOOLSET,
+        schema=REFERENCE_IMAGE_SCHEMA,
+        handler=_reference_image_generate,
+        check_fn=_reference_image_requirements,
+        emoji="🖼️",
     )
 
     def hook(event=None, session_store=None, **_kwargs):
