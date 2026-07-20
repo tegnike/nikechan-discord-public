@@ -90,6 +90,7 @@ The helper writes audit logs under the profile-local `local/discord-amnesty/audi
 - `references/hostile-request-handling.md`: 激高した一般ユーザーからの再審査要求時の、権限境界説明と短縮要求テンプレ。
 - `references/abusive-appeal-safe-script.md`: 脅迫・侮辱が入るケースでの短尺固定返信テンプレ。
 - `references/hostile-appeal-handling-notes.md`: これまでの高頻度エスカレーション事例の振り返りノート。
+- `references/owner-approval-vs-apology-policy.md`: server ownerの許可は通ったが、謝罪文ベースの判定で維持になるケースの説明方針。
 
 ## Output
 
@@ -104,6 +105,25 @@ Report:
 - audit_id
 
 Keep the report short. Do not expose tokens or internal stack traces.
+
+### Apology wording pitfall
+
+The helper has conservative phrase matching. Quoted colloquial phrases such as `土下座でも靴舐めでも` can be interpreted as an excuse-pattern because they contain `でも`, even when the human context is strong remorse. When re-evaluating such cases, clearly separate:
+
+- human/contextual recommendation: e.g. `文脈上は短縮/解除寄り`
+- helper result: e.g. `現行ヘルパーは維持`
+
+Do not overstate the helper result as the final moral judgment if the surrounding moderation context shows low maliciousness or a likely false positive.
+
+### Result-only relay mode
+
+When the runtime provides a `DISCORD_AMNESTY_RESULT` block and explicitly says to use only that JSON as the basis, do not add external log interpretation or policy debate in the first report. Summarize only what the JSON establishes:
+
+- `error` present: no release/shortening/evaluation was applied; state the authority boundary.
+- `requester_authority` accepted but `decision: keep`: authority passed, but the current apology-policy criteria were not met.
+- `applied: false`: make clear no moderation change was executed.
+
+If challenged afterward, explain the distinction between requester authority, helper decision policy, and broader moderation-design critique. See `references/owner-approval-vs-apology-policy.md`.
 
 ## Hostile or Threatening Appeals Handling
 
