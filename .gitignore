@@ -19,6 +19,15 @@ channel_directory.json
 .skills_prompt_snapshot.json
 .no-bundled-skills
 .clean_shutdown
+.restart_last_processed.json
+.update_exit_code
+context_length_cache.yaml
+models_dev_cache.json
+ollama_cloud_models_cache.json
+pastes/
+processes.json
+state-snapshots/
+tmp/
 
 # caches / generated files
 node_modules/
@@ -80,6 +89,7 @@ skills/.bundled_manifest
 skills/.curator_state
 skills/.usage.json
 skills/.usage.json.lock
+skills/.curator_backups/
 
 # Hermes mutates this on every cron tick; keep schedule source in cron/jobs.template.json
 cron/jobs.json
