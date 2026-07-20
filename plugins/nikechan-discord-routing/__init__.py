@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -183,13 +184,15 @@ REFERENCE_IMAGE_MAX_FILES = 4
 REFERENCE_IMAGE_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 _REFERENCE_IMAGE_CONTEXTS: dict[str, tuple[float, tuple[str, ...]]] = {}
 _REFERENCE_IMAGE_CONTEXT_LOCK = threading.Lock()
-PENDING_IMAGE_REFERENCE_TTL_SECONDS = 60
-PENDING_IMAGE_REFERENCE_MAX_CONTEXTS = 64
-_PENDING_IMAGE_REFERENCES: dict[str, tuple[float, tuple[str, ...]]] = {}
-_PENDING_IMAGE_REFERENCE_LOCK = threading.Lock()
+PERSISTED_IMAGE_REFERENCE_RETENTION_SECONDS = 7 * 24 * 60 * 60
+PERSISTED_IMAGE_REFERENCE_MAX_CONTEXTS = 1024
+_PERSISTED_IMAGE_REFERENCE_LOCK = threading.Lock()
 _EMPTY_DISCORD_MESSAGE_PLACEHOLDERS = {
     "(The user sent a message with no text content)",
 }
+_IMAGE_REFERENCE_NOUN_RE = re.compile(r"(画像|写真|添付|イラスト|絵|スクショ|スクリーンショット)", re.I)
+_IMAGE_REFERENCE_ACTION_RE = re.compile(r"(追加|合成|加工|編集|生成|作って|描いて|変えて|使って|参照)", re.I)
+_IMAGE_REFERENCE_DEICTIC_RE = re.compile(r"(これ|それ|この|その|さっき|先ほど|前の|送った|アップした)", re.I)
 
 
 def _visible_user_text(text: str) -> str:
@@ -241,6 +244,7 @@ def _safe_inbound_reference_paths(event: Any) -> list[Path]:
     allowed_roots = [
         (profile / "image_cache").resolve(),
         (profile / "cache" / "images").resolve(),
+        (profile / "cache" / "discord-image-references" / "files").resolve(),
     ]
     selected: list[Path] = []
     total_bytes = 0
@@ -276,68 +280,201 @@ def _event_text_is_effectively_empty(event: Any) -> bool:
     return not text.strip() or text.strip() in _EMPTY_DISCORD_MESSAGE_PLACEHOLDERS
 
 
-def _pending_image_reference_key(event: Any) -> str | None:
+def _persisted_image_reference_root() -> Path:
+    return _profile_root() / "cache" / "discord-image-references"
+
+
+def _persisted_image_reference_index_path() -> Path:
+    return _persisted_image_reference_root() / "index.json"
+
+
+def _load_persisted_image_reference_index() -> dict[str, Any]:
+    path = _persisted_image_reference_index_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {"version": 1, "references": {}}
+    references = payload.get("references") if isinstance(payload, dict) else None
+    if not isinstance(references, dict):
+        return {"version": 1, "references": {}}
+    return {"version": 1, "references": references}
+
+
+def _write_persisted_image_reference_index(payload: dict[str, Any]) -> None:
+    root = _persisted_image_reference_root()
+    root.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=root,
+            prefix=".index-",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, _persisted_image_reference_index_path())
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+
+def _delete_persisted_reference_files(paths: list[str]) -> None:
+    files_root = (_persisted_image_reference_root() / "files").resolve()
+    for raw_path in paths:
+        try:
+            path = Path(raw_path).resolve()
+            if _path_is_within(path, files_root):
+                path.unlink(missing_ok=True)
+        except (OSError, RuntimeError):
+            continue
+
+
+def _persisted_record_created_at(record: Any) -> float:
+    try:
+        return float(record.get("created_at") or 0) if isinstance(record, dict) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _prune_persisted_image_reference_index(payload: dict[str, Any], now: float) -> bool:
+    references = payload.setdefault("references", {})
+    changed = False
+    for message_id, record in list(references.items()):
+        paths = list(record.get("paths") or []) if isinstance(record, dict) else []
+        try:
+            expires_at = float(record.get("expires_at") or 0) if isinstance(record, dict) else 0.0
+        except (TypeError, ValueError):
+            expires_at = 0.0
+        expired = expires_at <= now
+        missing = not paths or not all(Path(path).is_file() for path in paths)
+        if expired or missing:
+            _delete_persisted_reference_files(paths)
+            references.pop(message_id, None)
+            changed = True
+    if len(references) > PERSISTED_IMAGE_REFERENCE_MAX_CONTEXTS:
+        oldest_ids = sorted(
+            references,
+            key=lambda message_id: _persisted_record_created_at(references[message_id]),
+        )[: len(references) - PERSISTED_IMAGE_REFERENCE_MAX_CONTEXTS]
+        for message_id in oldest_ids:
+            record = references.pop(message_id)
+            _delete_persisted_reference_files(list(record.get("paths") or []))
+            changed = True
+    return changed
+
+
+def _persist_image_references(event: Any, paths: list[Path]) -> int:
+    message_id = _source_message_id(event)
     channel = _current_channel(event)
     user_id = _source_user_id(event)
-    if not channel or not user_id:
-        return None
-    return f"{channel}:{user_id}"
+    if not message_id or not channel or not user_id or not paths:
+        return 0
+    safe_message_id = re.sub(r"[^A-Za-z0-9_-]", "_", message_id)[:128]
+    now = time.time()
+    with _PERSISTED_IMAGE_REFERENCE_LOCK:
+        payload = _load_persisted_image_reference_index()
+        _prune_persisted_image_reference_index(payload, now)
+        references = payload.setdefault("references", {})
+        previous = references.get(message_id)
+        previous_paths = list(previous.get("paths") or []) if isinstance(previous, dict) else []
+        files_root = _persisted_image_reference_root() / "files"
+        files_root.mkdir(parents=True, exist_ok=True)
+        copied_paths: list[str] = []
+        for index, source in enumerate(paths[:REFERENCE_IMAGE_MAX_FILES]):
+            mime_type = _image_mime_type(source)
+            suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mime_type or "")
+            if not suffix:
+                continue
+            destination = files_root / f"{safe_message_id}-{index}{suffix}"
+            temporary = files_root / f".{safe_message_id}-{index}{suffix}.tmp"
+            try:
+                shutil.copy2(source, temporary)
+                os.replace(temporary, destination)
+            except OSError as exc:
+                logger.warning("nikechan-discord-routing image persistence copy failed: %s", exc)
+                continue
+            finally:
+                temporary.unlink(missing_ok=True)
+            copied_paths.append(str(destination.resolve()))
+        if not copied_paths:
+            return 0
+        references[message_id] = {
+            "message_id": message_id,
+            "channel_id": channel,
+            "user_id": user_id,
+            "created_at": now,
+            "expires_at": now + PERSISTED_IMAGE_REFERENCE_RETENTION_SECONDS,
+            "paths": copied_paths,
+        }
+        _delete_persisted_reference_files([path for path in previous_paths if path not in copied_paths])
+        _prune_persisted_image_reference_index(payload, now)
+        _write_persisted_image_reference_index(payload)
+    return len(copied_paths)
 
 
-def _remember_pending_image_references(event: Any, paths: list[Path]) -> None:
-    key = _pending_image_reference_key(event)
-    if not key or not paths:
-        return
-    now = time.monotonic()
-    with _PENDING_IMAGE_REFERENCE_LOCK:
-        expired = [
-            item_key
-            for item_key, (expiry, _paths) in _PENDING_IMAGE_REFERENCES.items()
-            if expiry <= now
+def _looks_like_persisted_image_followup(text: str) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(
+        _IMAGE_REFERENCE_NOUN_RE.search(text)
+        or (_IMAGE_REFERENCE_ACTION_RE.search(text) and _IMAGE_REFERENCE_DEICTIC_RE.search(text))
+    )
+
+
+def _persisted_image_references_for_event(event: Any) -> list[str]:
+    channel = _current_channel(event)
+    user_id = _source_user_id(event)
+    if not channel:
+        return []
+    text = getattr(event, "text", "") or ""
+    reply_to_message_id = str(getattr(event, "reply_to_message_id", None) or "")
+    linked_message_ids = [
+        match.group(3)
+        for match in DISCORD_MESSAGE_URL_RE.finditer(text if isinstance(text, str) else "")
+        if match.group(2) == channel
+    ]
+    now = time.time()
+    with _PERSISTED_IMAGE_REFERENCE_LOCK:
+        payload = _load_persisted_image_reference_index()
+        changed = _prune_persisted_image_reference_index(payload, now)
+        references = payload.get("references", {})
+        exact_ids = [value for value in [reply_to_message_id, *linked_message_ids] if value]
+        for message_id in exact_ids:
+            record = references.get(message_id)
+            if isinstance(record, dict) and record.get("channel_id") == channel:
+                if changed:
+                    _write_persisted_image_reference_index(payload)
+                return list(record.get("paths") or [])
+        if not user_id or not _looks_like_persisted_image_followup(text):
+            if changed:
+                _write_persisted_image_reference_index(payload)
+            return []
+        candidates = [
+            record
+            for record in references.values()
+            if isinstance(record, dict)
+            and record.get("channel_id") == channel
+            and record.get("user_id") == user_id
         ]
-        for item_key in expired:
-            _PENDING_IMAGE_REFERENCES.pop(item_key, None)
-        existing_expiry, existing_paths = _PENDING_IMAGE_REFERENCES.get(key, (0.0, ()))
-        combined = list(existing_paths) if existing_expiry > now else []
-        for path in paths:
-            value = str(path)
-            if value not in combined:
-                combined.append(value)
-        _PENDING_IMAGE_REFERENCES[key] = (
-            now + PENDING_IMAGE_REFERENCE_TTL_SECONDS,
-            tuple(combined[-REFERENCE_IMAGE_MAX_FILES:]),
-        )
-        while len(_PENDING_IMAGE_REFERENCES) > PENDING_IMAGE_REFERENCE_MAX_CONTEXTS:
-            oldest = min(
-                _PENDING_IMAGE_REFERENCES,
-                key=lambda item_key: _PENDING_IMAGE_REFERENCES[item_key][0],
-            )
-            _PENDING_IMAGE_REFERENCES.pop(oldest, None)
+        candidates.sort(key=_persisted_record_created_at, reverse=True)
+        if changed:
+            _write_persisted_image_reference_index(payload)
+        return list(candidates[0].get("paths") or []) if candidates else []
 
 
-def _consume_pending_image_references(event: Any) -> list[str]:
-    key = _pending_image_reference_key(event)
-    if not key:
-        return []
-    now = time.monotonic()
-    with _PENDING_IMAGE_REFERENCE_LOCK:
-        item = _PENDING_IMAGE_REFERENCES.pop(key, None)
-    if not item:
-        return []
-    expiry, paths = item
-    if expiry <= now:
-        return []
-    return list(paths)
-
-
-def _attach_pending_image_references(event: Any) -> int:
-    pending = _consume_pending_image_references(event)
-    if not pending:
+def _attach_persisted_image_references(event: Any) -> int:
+    persisted = _persisted_image_references_for_event(event)
+    if not persisted:
         return 0
     media_urls = list(getattr(event, "media_urls", None) or [])
     media_types = list(getattr(event, "media_types", None) or [])
     added = 0
-    for value in pending:
+    for value in persisted:
         if value in media_urls:
             continue
         mime_type = _image_mime_type(Path(value))
@@ -386,6 +523,7 @@ def _resolve_reference_context(token: str) -> list[Path]:
     allowed_roots = [
         (profile / "image_cache").resolve(),
         (profile / "cache" / "images").resolve(),
+        (profile / "cache" / "discord-image-references" / "files").resolve(),
     ]
     resolved: list[Path] = []
     total_bytes = 0
@@ -3499,26 +3637,32 @@ def register(ctx):
             # ordinary user text.
             return None
         current_references = _safe_inbound_reference_paths(event)
+        try:
+            persisted_reference_count = _persist_image_references(event, current_references)
+        except Exception:
+            persisted_reference_count = 0
+            logger.exception("nikechan-discord-routing failed to persist image references")
         if _event_text_is_effectively_empty(event) and current_references:
-            _remember_pending_image_references(event, current_references)
             _discord_reaction_rest(event, "✅")
             logger.info(
-                "nikechan-discord-routing held image-only message for follow-up: count=%d",
-                len(current_references),
+                "nikechan-discord-routing stored image-only message for later reference: count=%d",
+                persisted_reference_count,
             )
-            return {"action": "skip", "reason": "pending_image_followup"}
-        carried_reference_count = _attach_pending_image_references(event)
-        if carried_reference_count:
+            return {"action": "skip", "reason": "stored_image_reference"}
+        restored_reference_count = 0
+        if not current_references:
+            restored_reference_count = _attach_persisted_image_references(event)
+        if restored_reference_count:
             logger.info(
-                "nikechan-discord-routing attached pending image references to follow-up: count=%d",
-                carried_reference_count,
+                "nikechan-discord-routing restored persisted image references: count=%d",
+                restored_reference_count,
             )
         attachment_text = _attachment_only_text(event)
         nickname_routed = _rewrite_discord_nickname_update(text, event)
         if nickname_routed:
             _remember_recent_message(event)
             return nickname_routed
-        if _config_bool("should_reply", False):
+        if _config_bool("should_reply", False) and not restored_reference_count:
             _discord_reaction_rest(event, "👀")
             decision = _should_reply(event)
             if not decision.get("reply"):

@@ -21,7 +21,15 @@ HOME_CHANNEL = "1404724174890602496"
 GUILD = "1404689195150217217"
 
 
-def discord_event(channel_id=HOME_CHANNEL, text="", media_urls=None, media_types=None, user_id="123456789012345678"):
+def discord_event(
+    channel_id=HOME_CHANNEL,
+    text="",
+    media_urls=None,
+    media_types=None,
+    user_id="123456789012345678",
+    message_id="123456789012345679",
+    reply_to_message_id=None,
+):
     source = SimpleNamespace(
         platform="discord",
         chat_id=channel_id,
@@ -33,6 +41,8 @@ def discord_event(channel_id=HOME_CHANNEL, text="", media_urls=None, media_types
         text=text,
         media_urls=list(media_urls or []),
         media_types=list(media_types or []),
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
     )
 
 
@@ -41,8 +51,6 @@ class DiscordRoutingHistoryTests(unittest.TestCase):
         routing._ROUTE_INTENT_CACHE.clear()
         with routing._REFERENCE_IMAGE_CONTEXT_LOCK:
             routing._REFERENCE_IMAGE_CONTEXTS.clear()
-        with routing._PENDING_IMAGE_REFERENCE_LOCK:
-            routing._PENDING_IMAGE_REFERENCES.clear()
 
     def test_deep_history_phrase_routes_without_terminal_exploration(self):
         text = "もっとずっと古い記憶にリーチして"
@@ -233,7 +241,7 @@ class DiscordRoutingHistoryTests(unittest.TestCase):
         self.assertIn("reference_token:", result["text"])
         self.assertIn(event.text, result["text"])
 
-    def test_gateway_hook_carries_image_only_message_into_same_user_followup(self):
+    def test_gateway_hook_restores_persisted_image_for_same_user_followup(self):
         class FakePluginContext:
             def register_tool(self, **_kwargs):
                 pass
@@ -252,25 +260,47 @@ class DiscordRoutingHistoryTests(unittest.TestCase):
                 text="(The user sent a message with no text content)",
                 media_urls=[str(reference)],
                 media_types=["image/png"],
+                message_id="image-message",
             )
-            followup_event = discord_event(text="この山の画像に君を追加した画像を生成して")
+            followup_event = discord_event(
+                text="この山の画像に君を追加した画像を生成して",
+                message_id="followup-message",
+            )
             ctx = FakePluginContext()
             routing.register(ctx)
             with (
                 mock.patch.object(routing, "_profile_root", return_value=root),
                 mock.patch.object(routing, "_config_bool", return_value=False),
                 mock.patch.object(routing, "_with_person_context", side_effect=lambda text, _event: text),
+                mock.patch.object(routing.time, "time", return_value=1000.0),
             ):
                 held = ctx.hook(event=image_event)
+            with (
+                mock.patch.object(routing, "_profile_root", return_value=root),
+                mock.patch.object(routing, "_config_bool", return_value=False),
+                mock.patch.object(routing, "_with_person_context", side_effect=lambda text, _event: text),
+                mock.patch.object(routing.time, "time", return_value=1000.0 + 6 * 24 * 60 * 60),
+            ):
                 result = ctx.hook(event=followup_event)
 
-        self.assertEqual(held, {"action": "skip", "reason": "pending_image_followup"})
+            stored_path = root / "cache" / "discord-image-references" / "files" / "image-message-0.png"
+            index_path = root / "cache" / "discord-image-references" / "index.json"
+            self.assertTrue(stored_path.is_file())
+            self.assertTrue(index_path.is_file())
+
+        self.assertEqual(held, {"action": "skip", "reason": "stored_image_reference"})
         self.assertEqual(result["action"], "rewrite")
         self.assertIn("current_discord_attachment_reference_count: 1", result["text"])
         self.assertIn("reference_token:", result["text"])
-        self.assertEqual(followup_event.media_urls, [str(reference.resolve())])
+        self.assertEqual(followup_event.media_urls, [str(stored_path.resolve())])
+        self.assertEqual(routing.PERSISTED_IMAGE_REFERENCE_RETENTION_SECONDS, 7 * 24 * 60 * 60)
 
-    def test_pending_image_is_not_exposed_to_another_user(self):
+    def test_generic_creation_request_does_not_restore_stale_image(self):
+        self.assertFalse(routing._looks_like_persisted_image_followup("新しいタスクを作って"))
+        self.assertTrue(routing._looks_like_persisted_image_followup("この画像を使って"))
+        self.assertTrue(routing._looks_like_persisted_image_followup("これを加工して"))
+
+    def test_persisted_image_is_not_exposed_to_another_user_without_reply(self):
         class FakePluginContext:
             def register_tool(self, **_kwargs):
                 pass
@@ -290,8 +320,13 @@ class DiscordRoutingHistoryTests(unittest.TestCase):
                 media_urls=[str(reference)],
                 media_types=["image/png"],
                 user_id="owner",
+                message_id="private-image",
             )
-            other_user_event = discord_event(text="画像を作って", user_id="other")
+            other_user_event = discord_event(
+                text="画像を作って",
+                user_id="other",
+                message_id="other-user-message",
+            )
             ctx = FakePluginContext()
             routing.register(ctx)
             with (
@@ -305,6 +340,96 @@ class DiscordRoutingHistoryTests(unittest.TestCase):
         self.assertEqual(result["action"], "rewrite")
         self.assertIn("current_discord_attachment_reference_count: 0", result["text"])
         self.assertNotIn("reference_token:", result["text"])
+
+    def test_reply_can_restore_another_users_image_from_same_channel(self):
+        class FakePluginContext:
+            def register_tool(self, **_kwargs):
+                pass
+
+            def register_hook(self, _name, hook):
+                self.hook = hook
+
+        png = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "image_cache"
+            cache.mkdir()
+            reference = cache / "shared.png"
+            reference.write_bytes(png)
+            image_event = discord_event(
+                text="(The user sent a message with no text content)",
+                media_urls=[str(reference)],
+                media_types=["image/png"],
+                user_id="owner",
+                message_id="shared-image",
+            )
+            reply_event = discord_event(
+                text="これを使ってAIニケちゃんも追加して",
+                user_id="other",
+                message_id="reply-message",
+                reply_to_message_id="shared-image",
+            )
+            ctx = FakePluginContext()
+            routing.register(ctx)
+            with (
+                mock.patch.object(routing, "_profile_root", return_value=root),
+                mock.patch.object(routing, "_config_bool", return_value=False),
+                mock.patch.object(routing, "_with_person_context", side_effect=lambda text, _event: text),
+            ):
+                ctx.hook(event=image_event)
+                result = ctx.hook(event=reply_event)
+
+        self.assertEqual(result["action"], "rewrite")
+        self.assertIn("current_discord_attachment_reference_count: 1", result["text"])
+        self.assertIn("reference_token:", result["text"])
+
+    def test_persisted_image_expires_after_seven_days(self):
+        class FakePluginContext:
+            def register_tool(self, **_kwargs):
+                pass
+
+            def register_hook(self, _name, hook):
+                self.hook = hook
+
+        png = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "image_cache"
+            cache.mkdir()
+            reference = cache / "old.png"
+            reference.write_bytes(png)
+            image_event = discord_event(
+                text="(The user sent a message with no text content)",
+                media_urls=[str(reference)],
+                media_types=["image/png"],
+                message_id="old-image",
+            )
+            followup_event = discord_event(text="この画像を使って", message_id="late-followup")
+            ctx = FakePluginContext()
+            routing.register(ctx)
+            with (
+                mock.patch.object(routing, "_profile_root", return_value=root),
+                mock.patch.object(routing, "_config_bool", return_value=False),
+                mock.patch.object(routing, "_with_person_context", side_effect=lambda text, _event: text),
+                mock.patch.object(routing.time, "time", return_value=1000.0),
+            ):
+                ctx.hook(event=image_event)
+            with (
+                mock.patch.object(routing, "_profile_root", return_value=root),
+                mock.patch.object(routing, "_config_bool", return_value=False),
+                mock.patch.object(routing, "_with_person_context", side_effect=lambda text, _event: text),
+                mock.patch.object(
+                    routing.time,
+                    "time",
+                    return_value=1001.0 + routing.PERSISTED_IMAGE_REFERENCE_RETENTION_SECONDS,
+                ),
+            ):
+                result = ctx.hook(event=followup_event)
+
+            stored_path = root / "cache" / "discord-image-references" / "files" / "old-image-0.png"
+            self.assertFalse(stored_path.exists())
+
+        self.assertIn("current_discord_attachment_reference_count: 0", result["text"])
 
     def test_nikechan_and_attached_character_use_both_references(self):
         png = bytes.fromhex(
