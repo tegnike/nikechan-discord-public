@@ -147,11 +147,11 @@ async function evaluateVoiceState(reason) {
     startTimer = null;
     log("cancel start timer", { reason });
   }
-  if (session && !stopTimer) {
+  if (session && !session.stopping && !stopTimer) {
     log("schedule recording stop", { after_ms: END_GRACE_MS, reason });
     stopTimer = setTimeout(async () => {
       stopTimer = null;
-      if ((await humanCount()) === 0 && session) await stopSession();
+      if ((await humanCount()) === 0 && session && !session.stopping) await stopSession();
     }, END_GRACE_MS);
   }
 }
@@ -727,9 +727,9 @@ function parseJsonObject(text) {
 
 async function stopSession() {
   const finalSession = session;
-  if (!finalSession) return;
-  log("recording session stopping", { session_id: finalSession.id });
+  if (!finalSession || finalSession.stopping) return;
   finalSession.stopping = true;
+  log("recording session stopping", { session_id: finalSession.id });
 
   if (connection) {
     connection.destroy();
