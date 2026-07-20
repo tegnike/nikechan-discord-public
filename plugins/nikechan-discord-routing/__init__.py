@@ -183,6 +183,13 @@ REFERENCE_IMAGE_MAX_FILES = 4
 REFERENCE_IMAGE_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 _REFERENCE_IMAGE_CONTEXTS: dict[str, tuple[float, tuple[str, ...]]] = {}
 _REFERENCE_IMAGE_CONTEXT_LOCK = threading.Lock()
+PENDING_IMAGE_REFERENCE_TTL_SECONDS = 60
+PENDING_IMAGE_REFERENCE_MAX_CONTEXTS = 64
+_PENDING_IMAGE_REFERENCES: dict[str, tuple[float, tuple[str, ...]]] = {}
+_PENDING_IMAGE_REFERENCE_LOCK = threading.Lock()
+_EMPTY_DISCORD_MESSAGE_PLACEHOLDERS = {
+    "(The user sent a message with no text content)",
+}
 
 
 def _visible_user_text(text: str) -> str:
@@ -260,6 +267,88 @@ def _safe_inbound_reference_paths(event: Any) -> list[Path]:
         if len(selected) >= REFERENCE_IMAGE_MAX_FILES:
             break
     return selected
+
+
+def _event_text_is_effectively_empty(event: Any) -> bool:
+    text = getattr(event, "text", "") or ""
+    if not isinstance(text, str):
+        return True
+    return not text.strip() or text.strip() in _EMPTY_DISCORD_MESSAGE_PLACEHOLDERS
+
+
+def _pending_image_reference_key(event: Any) -> str | None:
+    channel = _current_channel(event)
+    user_id = _source_user_id(event)
+    if not channel or not user_id:
+        return None
+    return f"{channel}:{user_id}"
+
+
+def _remember_pending_image_references(event: Any, paths: list[Path]) -> None:
+    key = _pending_image_reference_key(event)
+    if not key or not paths:
+        return
+    now = time.monotonic()
+    with _PENDING_IMAGE_REFERENCE_LOCK:
+        expired = [
+            item_key
+            for item_key, (expiry, _paths) in _PENDING_IMAGE_REFERENCES.items()
+            if expiry <= now
+        ]
+        for item_key in expired:
+            _PENDING_IMAGE_REFERENCES.pop(item_key, None)
+        existing_expiry, existing_paths = _PENDING_IMAGE_REFERENCES.get(key, (0.0, ()))
+        combined = list(existing_paths) if existing_expiry > now else []
+        for path in paths:
+            value = str(path)
+            if value not in combined:
+                combined.append(value)
+        _PENDING_IMAGE_REFERENCES[key] = (
+            now + PENDING_IMAGE_REFERENCE_TTL_SECONDS,
+            tuple(combined[-REFERENCE_IMAGE_MAX_FILES:]),
+        )
+        while len(_PENDING_IMAGE_REFERENCES) > PENDING_IMAGE_REFERENCE_MAX_CONTEXTS:
+            oldest = min(
+                _PENDING_IMAGE_REFERENCES,
+                key=lambda item_key: _PENDING_IMAGE_REFERENCES[item_key][0],
+            )
+            _PENDING_IMAGE_REFERENCES.pop(oldest, None)
+
+
+def _consume_pending_image_references(event: Any) -> list[str]:
+    key = _pending_image_reference_key(event)
+    if not key:
+        return []
+    now = time.monotonic()
+    with _PENDING_IMAGE_REFERENCE_LOCK:
+        item = _PENDING_IMAGE_REFERENCES.pop(key, None)
+    if not item:
+        return []
+    expiry, paths = item
+    if expiry <= now:
+        return []
+    return list(paths)
+
+
+def _attach_pending_image_references(event: Any) -> int:
+    pending = _consume_pending_image_references(event)
+    if not pending:
+        return 0
+    media_urls = list(getattr(event, "media_urls", None) or [])
+    media_types = list(getattr(event, "media_types", None) or [])
+    added = 0
+    for value in pending:
+        if value in media_urls:
+            continue
+        mime_type = _image_mime_type(Path(value))
+        if not mime_type:
+            continue
+        media_urls.append(value)
+        media_types.append(mime_type)
+        added += 1
+    event.media_urls = media_urls
+    event.media_types = media_types
+    return added
 
 
 def _register_reference_context(paths: list[Path]) -> str:
@@ -3099,8 +3188,7 @@ def _event_media_items(event: Any) -> list[dict[str, str]]:
 
 
 def _attachment_only_text(event: Any) -> str:
-    text = getattr(event, "text", "") or ""
-    if isinstance(text, str) and text.strip():
+    if not _event_text_is_effectively_empty(event):
         return ""
     image_count = 0
     for item in _event_media_items(event):
@@ -3404,13 +3492,28 @@ def register(ctx):
         if "discord" not in _platform_name(event):
             return None
         text = getattr(event, "text", "") or ""
-        attachment_text = _attachment_only_text(event)
         if isinstance(text, str) and text.lstrip().startswith("/"):
             # Slash commands must stay at the beginning of the message so the
             # Hermes gateway command dispatcher can recognize them. Adding
             # Discord/person context here turns commands like /reset into
             # ordinary user text.
             return None
+        current_references = _safe_inbound_reference_paths(event)
+        if _event_text_is_effectively_empty(event) and current_references:
+            _remember_pending_image_references(event, current_references)
+            _discord_reaction_rest(event, "✅")
+            logger.info(
+                "nikechan-discord-routing held image-only message for follow-up: count=%d",
+                len(current_references),
+            )
+            return {"action": "skip", "reason": "pending_image_followup"}
+        carried_reference_count = _attach_pending_image_references(event)
+        if carried_reference_count:
+            logger.info(
+                "nikechan-discord-routing attached pending image references to follow-up: count=%d",
+                carried_reference_count,
+            )
+        attachment_text = _attachment_only_text(event)
         nickname_routed = _rewrite_discord_nickname_update(text, event)
         if nickname_routed:
             _remember_recent_message(event)
