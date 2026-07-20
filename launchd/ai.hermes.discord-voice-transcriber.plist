@@ -40,6 +40,10 @@
     <string>4</string>
     <key>DISCORD_VOICE_LOCAL_MAX_SESSION_SECONDS</key>
     <string>10800</string>
+    <key>DISCORD_VOICE_LOCAL_MAX_TOTAL_SESSION_SECONDS</key>
+    <string>43200</string>
+    <key>DISCORD_VOICE_LOCAL_SEGMENT_SECONDS</key>
+    <string>1200</string>
     <key>DISCORD_VOICE_LOCAL_MAX_SESSION_CHUNKS</key>
     <string>10000</string>
     <key>DISCORD_VOICE_MAX_SESSION_SECONDS</key>

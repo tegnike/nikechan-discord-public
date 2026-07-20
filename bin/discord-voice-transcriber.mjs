@@ -63,7 +63,45 @@ const LOCAL_WHISPER_BIN = ENV.DISCORD_VOICE_LOCAL_WHISPER_BIN || "";
 const LOCAL_WHISPER_MODEL = path.resolve(PROFILE_DIR, ENV.DISCORD_VOICE_LOCAL_WHISPER_MODEL || "models/whisper/ggml-large-v3-turbo.bin");
 const LOCAL_WHISPER_THREADS = intEnv("DISCORD_VOICE_LOCAL_WHISPER_THREADS", 4);
 const LOCAL_MAX_SESSION_SECONDS = intEnv("DISCORD_VOICE_LOCAL_MAX_SESSION_SECONDS", 3 * 60 * 60);
+const LOCAL_MAX_TOTAL_SESSION_SECONDS = intEnv("DISCORD_VOICE_LOCAL_MAX_TOTAL_SESSION_SECONDS", 12 * 60 * 60);
+const LOCAL_SEGMENT_SECONDS = intEnv(
+  "DISCORD_VOICE_LOCAL_SEGMENT_SECONDS",
+  Math.min(LOCAL_MAX_SESSION_SECONDS, 20 * 60),
+);
 const LOCAL_MAX_SESSION_CHUNKS = intEnv("DISCORD_VOICE_LOCAL_MAX_SESSION_CHUNKS", 10000);
+const LLM_SUMMARY_ENABLED = boolEnv("DISCORD_VOICE_LLM_SUMMARY_ENABLED", true);
+const LLM_SUMMARY_PROVIDER = (
+  ENV.DISCORD_VOICE_LLM_SUMMARY_PROVIDER
+  || "hermes-codex"
+).trim().toLowerCase();
+const HERMES_BIN = ENV.DISCORD_VOICE_HERMES_BIN || "/Users/nikenike/.hermes/hermes-agent/venv/bin/hermes";
+const HERMES_SUMMARY_MODEL = (
+  ENV.DISCORD_VOICE_HERMES_SUMMARY_MODEL
+  || "gpt-5.5"
+).trim();
+const HERMES_SUMMARY_PROVIDER = (
+  ENV.DISCORD_VOICE_HERMES_SUMMARY_PROVIDER
+  || "openai-codex"
+).trim();
+const LLM_SUMMARY_BASE_URL = trimTrailingSlash(
+  ENV.DISCORD_VOICE_LLM_SUMMARY_BASE_URL
+  || ENV.NIKECHAN_AUX_LLM_BASE_URL
+  || ENV.HERMES_INFERENCE_BASE_URL
+  || "https://api.openai.com/v1",
+);
+const LLM_SUMMARY_API_KEY = (
+  ENV.DISCORD_VOICE_LLM_SUMMARY_API_KEY
+  || ENV.NIKECHAN_AUX_LLM_API_KEY
+  || ENV.OPENAI_API_KEY
+  || ""
+).trim();
+const LLM_SUMMARY_MODEL = (
+  ENV.DISCORD_VOICE_LLM_SUMMARY_MODEL
+  || ENV.NIKECHAN_AUX_LLM_MODEL
+  || ENV.HERMES_INFERENCE_MODEL
+  || "gpt-5.4-mini"
+).trim();
+const LLM_SUMMARY_MAX_CHARS_PER_SEGMENT = intEnv("DISCORD_VOICE_LLM_SUMMARY_MAX_CHARS_PER_SEGMENT", 7000);
 
 let client;
 let connection = null;
@@ -88,6 +126,10 @@ function boolEnv(name, fallback) {
 
 function firstCsv(value) {
   return String(value || "").split(",").map((item) => item.trim()).find(Boolean);
+}
+
+function trimTrailingSlash(value) {
+  return String(value || "").replace(/\/+$/, "");
 }
 
 function log(message, meta = undefined) {
@@ -361,23 +403,28 @@ async function transcribeSessionOnce(finalSession) {
 
   let audioPath = null;
   try {
-    audioPath = await buildSessionAudio(finalSession, chunks);
-    finalSession.sessionAudioPath = audioPath;
-    finalSession.transcriptionStatus.rendered_audio_bytes = fileSize(audioPath);
-    if (!isLocalProvider() && finalSession.transcriptionStatus.rendered_audio_bytes > MAX_SESSION_AUDIO_BYTES) {
-      finalSession.transcriptionStatus.status = "skipped";
-      finalSession.transcriptionStatus.reason = `rendered audio exceeds ${MAX_SESSION_AUDIO_BYTES} bytes`;
-      log("skip session transcription", finalSession.transcriptionStatus);
-      return;
+    let parsed;
+    if (isLocalProvider()) {
+      parsed = await localWhisperTranscribeSession(finalSession, null, chunks);
+      finalSession.sessionAudioPath = parsed.session_audio_path || path.join(finalSession.dir, "audio");
+      finalSession.transcriptionStatus.rendered_audio_bytes = Number(parsed.rendered_audio_bytes) || 0;
+    } else {
+      audioPath = await buildSessionAudio(finalSession, chunks);
+      finalSession.sessionAudioPath = audioPath;
+      finalSession.transcriptionStatus.rendered_audio_bytes = fileSize(audioPath);
+      if (finalSession.transcriptionStatus.rendered_audio_bytes > MAX_SESSION_AUDIO_BYTES) {
+        finalSession.transcriptionStatus.status = "skipped";
+        finalSession.transcriptionStatus.reason = `rendered audio exceeds ${MAX_SESSION_AUDIO_BYTES} bytes`;
+        log("skip session transcription", finalSession.transcriptionStatus);
+        return;
+      }
+      parsed = await geminiTranscribeSession(audioPath, chunks);
     }
-
-    const parsed = isLocalProvider()
-      ? await localWhisperTranscribeSession(finalSession, audioPath, chunks)
-      : await geminiTranscribeSession(audioPath, chunks);
     applyTranscriptionResult(finalSession, parsed, chunks);
     finalSession.transcriptionStatus.status = "completed";
     finalSession.transcriptionStatus.provider = isLocalProvider() ? "local" : "gemini";
     finalSession.transcriptionStatus.transcript_count = finalSession.transcripts.length;
+    finalSession.summaryMarkdown = await buildVoiceTimelineSummary(finalSession, chunks);
     log("session transcription completed", {
       session_id: finalSession.id,
       provider: finalSession.transcriptionStatus.provider,
@@ -414,7 +461,7 @@ function sessionSkipReason(chunks, durationMs, rawAudioBytes) {
     if (localWhisperUnavailable) return `local Whisper unavailable: ${localWhisperUnavailable.error}`;
     if (!fs.existsSync(LOCAL_WHISPER_MODEL)) return `local Whisper model is missing: ${LOCAL_WHISPER_MODEL}`;
     if (chunks.length > LOCAL_MAX_SESSION_CHUNKS) return `chunk count ${chunks.length} exceeds local limit ${LOCAL_MAX_SESSION_CHUNKS}`;
-    if (durationMs > LOCAL_MAX_SESSION_SECONDS * 1000) return `duration ${Math.round(durationMs / 1000)}s exceeds local limit ${LOCAL_MAX_SESSION_SECONDS}s`;
+    if (durationMs > LOCAL_MAX_TOTAL_SESSION_SECONDS * 1000) return `duration ${Math.round(durationMs / 1000)}s exceeds local total limit ${LOCAL_MAX_TOTAL_SESSION_SECONDS}s`;
     return null;
   }
   if (!GEMINI_API_KEY) return "GEMINI_API_KEY is missing";
@@ -430,8 +477,12 @@ function isLocalProvider() {
 }
 
 async function buildSessionAudio(finalSession, chunks) {
-  const listPath = path.join(finalSession.dir, "ffmpeg-concat.txt");
   const outputPath = path.join(finalSession.dir, isLocalProvider() ? "session-audio.wav" : "session-audio.ogg");
+  await buildAudioFromChunks(chunks, outputPath, path.join(finalSession.dir, "ffmpeg-concat.txt"));
+  return outputPath;
+}
+
+async function buildAudioFromChunks(chunks, outputPath, listPath) {
   const lines = chunks.map((chunk) => `file '${chunk.audio_path.replace(/'/g, "'\\''")}'`);
   fs.writeFileSync(listPath, `${lines.join("\n")}\n`);
   const commonArgs = [
@@ -461,7 +512,6 @@ async function buildSessionAudio(finalSession, chunks) {
     outputPath,
   ];
   await runCommand(FFMPEG_BIN, [...commonArgs, ...encodeArgs]);
-  return outputPath;
 }
 
 async function runCommand(command, args) {
@@ -480,9 +530,9 @@ async function runCommand(command, args) {
   });
 }
 
-async function runCommandCapture(command, args) {
+async function runCommandCapture(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], ...options });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => {
@@ -503,12 +553,24 @@ async function runCommandCapture(command, args) {
 
 async function localWhisperTranscribeSession(finalSession, audioPath, chunks) {
   const command = await resolveLocalWhisperCommand();
+  if (chunks.length === 0) {
+    return {
+      segments: [],
+      summary_markdown: "ローカルWhisperで文字起こし対象の発話が見つかりませんでした。",
+    };
+  }
+  const durationMs = Math.max(0, ...(chunks.map((chunk) => chunk.end_ms)), 0);
+  if (durationMs > LOCAL_MAX_SESSION_SECONDS * 1000) {
+    return localWhisperTranscribeSegments(finalSession, command, chunks);
+  }
   const outBase = path.join(finalSession.dir, "local-whisper");
+  const targetAudioPath = audioPath || path.join(finalSession.dir, "session-audio.wav");
+  if (!audioPath) await buildAudioFromChunks(chunks, targetAudioPath, path.join(finalSession.dir, "ffmpeg-concat.txt"));
   const args = [
     "-m",
     LOCAL_WHISPER_MODEL,
     "-f",
-    audioPath,
+    targetAudioPath,
     "-l",
     LANGUAGE,
     "-t",
@@ -523,7 +585,6 @@ async function localWhisperTranscribeSession(finalSession, audioPath, chunks) {
   const txtPath = `${outBase}.txt`;
   const rawText = fs.existsSync(txtPath) ? fs.readFileSync(txtPath, "utf8") : stdout;
   const text = normalizeWhisperText(rawText);
-  const durationMs = Math.max(0, ...(chunks.map((chunk) => chunk.end_ms)), 0);
   return {
     segments: [{
       seq: chunks[0]?.seq || 1,
@@ -532,12 +593,328 @@ async function localWhisperTranscribeSession(finalSession, audioPath, chunks) {
       speaker: "VC",
       text: text || "[inaudible]",
     }],
-    summary_markdown: [
-      "ローカルWhisperで文字起こしを生成しました。",
-      "クラウドAPIは使用していません。",
-      "要約は生成していません。添付のtranscript.mdを確認してください。",
-    ].join("\n"),
+    summary_markdown: localTimelineSummaryMarkdown(finalSession, [{
+      start_ms: 0,
+      end_ms: durationMs,
+      chunks,
+      text,
+    }]),
+    session_audio_path: targetAudioPath,
+    rendered_audio_bytes: fileSize(targetAudioPath),
   };
+}
+
+async function localWhisperTranscribeSegments(finalSession, command, chunks) {
+  const segmentDir = path.join(finalSession.dir, "local-whisper-segments");
+  ensureDir(segmentDir);
+  const groups = splitChunksByDuration(chunks, LOCAL_SEGMENT_SECONDS * 1000);
+  const segments = [];
+  const timelineItems = [];
+  for (const [index, group] of groups.entries()) {
+    const ordinal = String(index + 1).padStart(3, "0");
+    const audioPath = path.join(segmentDir, `${ordinal}.wav`);
+    const listPath = path.join(segmentDir, `${ordinal}.txt`);
+    const outBase = path.join(segmentDir, `${ordinal}-whisper`);
+    await buildAudioFromChunks(group, audioPath, listPath);
+    const args = [
+      "-m",
+      LOCAL_WHISPER_MODEL,
+      "-f",
+      audioPath,
+      "-l",
+      LANGUAGE,
+      "-t",
+      String(LOCAL_WHISPER_THREADS),
+      "-otxt",
+      "-of",
+      outBase,
+      "-nt",
+      "-np",
+    ];
+    const { stdout } = await runCommandCapture(command, args);
+    const txtPath = `${outBase}.txt`;
+    const rawText = fs.existsSync(txtPath) ? fs.readFileSync(txtPath, "utf8") : stdout;
+    const text = normalizeWhisperText(rawText);
+    const startMs = Math.min(...group.map((chunk) => chunk.start_ms));
+    const endMs = Math.max(...group.map((chunk) => chunk.end_ms));
+    segments.push({
+      seq: group[0]?.seq || index + 1,
+      start_ms: startMs,
+      end_ms: endMs,
+      speaker: "VC",
+      text: text || "[inaudible]",
+    });
+    timelineItems.push({ start_ms: startMs, end_ms: endMs, chunks: group, text });
+    log("local whisper segment completed", {
+      session_id: finalSession.id,
+      segment: index + 1,
+      segments: groups.length,
+      chunks: group.length,
+      start_ms: startMs,
+      end_ms: endMs,
+    });
+  }
+  return {
+    segments,
+    summary_markdown: localTimelineSummaryMarkdown(finalSession, timelineItems),
+    session_audio_path: segmentDir,
+    rendered_audio_bytes: groups.reduce((sum, _group, index) => {
+      const ordinal = String(index + 1).padStart(3, "0");
+      return sum + fileSize(path.join(segmentDir, `${ordinal}.wav`));
+    }, 0),
+  };
+}
+
+function localTimelineSummaryMarkdown(finalSession, items) {
+  const lines = [
+    "VC文字起こし時系列まとめ（JST目安）",
+    `対象VC: <#${VOICE_CHANNEL_ID}>`,
+    `録音: ${formatJstDateTime(finalSession.startedAt)} - ${formatJstDateTime(new Date(finalSession.startedAt.getTime() + Math.max(0, ...items.map((item) => item.end_ms))))} JST`,
+    "",
+    "話者分離なしのWhisper transcriptを、録音chunk量から主話者推定して整理しています。",
+    "",
+  ];
+  for (const [index, item] of items.entries()) {
+    const timeRange = formatJstOffsetRange(finalSession.startedAt, item.start_ms, item.end_ms);
+    const speakers = topSpeakerNames(item.chunks, 3).join(" / ") || "不明";
+    const memo = compactTimelineText(item.text, 90);
+    lines.push(`${index + 1}. ${timeRange}`);
+    lines.push(`主な話者: ${speakers}`);
+    lines.push(`要約未生成です。全文は添付のtranscript.mdを確認してください。冒頭抜粋: ${memo}`);
+    lines.push("");
+  }
+  return lines.join("\n").trim();
+}
+
+function topSpeakerNames(chunks, limit) {
+  const stats = new Map();
+  for (const chunk of chunks) {
+    const name = String(chunk.display_name || chunk.user_id || "unknown");
+    const duration = Math.max(0, Number(chunk.end_ms || 0) - Number(chunk.start_ms || 0));
+    const current = stats.get(name) || { duration: 0, chunks: 0 };
+    current.duration += duration;
+    current.chunks += 1;
+    stats.set(name, current);
+  }
+  return [...stats.entries()]
+    .sort((a, b) => (b[1].duration - a[1].duration) || (b[1].chunks - a[1].chunks))
+    .slice(0, limit)
+    .map(([name]) => name);
+}
+
+function formatJstOffsetRange(startedAt, startMs, endMs) {
+  const start = formatJstMinute(new Date(startedAt.getTime() + startMs));
+  const end = formatJstMinute(new Date(startedAt.getTime() + endMs));
+  const startDate = start.split(" ")[0];
+  const endDate = end.split(" ")[0];
+  return startDate === endDate ? `${start}-${end.split(" ")[1]}` : `${start}-${end}`;
+}
+
+function formatJstMinute(date) {
+  const parts = new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const value = (type) => parts.find((part) => part.type === type)?.value || "";
+  return `${value("month")}/${value("day")} ${value("hour")}:${value("minute")}`;
+}
+
+function formatJstDateTime(date) {
+  const parts = new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const value = (type) => parts.find((part) => part.type === type)?.value || "";
+  return `${value("year")}/${value("month")}/${value("day")} ${value("hour")}:${value("minute")}`;
+}
+
+function compactTimelineText(text, maxLength) {
+  const compact = String(text || "")
+    .replace(/\[[^\]]+\]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!compact) return "内容不明";
+  return compact.length > maxLength ? `${compact.slice(0, maxLength - 1)}…` : compact;
+}
+
+async function buildVoiceTimelineSummary(finalSession, chunks) {
+  const fallback = localTimelineSummaryMarkdown(finalSession, transcriptItemsForSummary(finalSession, chunks));
+  if (!LLM_SUMMARY_ENABLED) return fallback;
+  if (finalSession.transcripts.length === 0) return fallback;
+
+  try {
+    const prompt = voiceSummaryPrompt(finalSession, chunks);
+    const summary = await requestChatCompletion([
+      {
+        role: "system",
+        content: [
+          "あなたはDiscord VCの文字起こしを日本語で時系列整理する編集者です。",
+          "入力はWhisper transcriptで、誤字・反復・英語ノイズ・話者混線を含みます。",
+          "分かる内容だけを、サンプルのように自然な日本語で要約してください。",
+          "Whisperの生の断片をそのまま貼らず、話題・相談内容・結論・脱線を整理します。",
+          "不明な箇所は無理に補完せず、聞き取り困難または雑談と書いてください。",
+          "出力は指定フォーマットのみ。Markdownコードブロックは禁止。",
+        ].join("\n"),
+      },
+      { role: "user", content: prompt },
+    ]);
+    if (!summary.trim()) return fallback;
+    log("llm voice summary completed", {
+      session_id: finalSession.id,
+      model: LLM_SUMMARY_MODEL,
+      chars: summary.length,
+    });
+    return summary.trim();
+  } catch (error) {
+    log("llm voice summary failed", { session_id: finalSession.id, error: String(error) });
+    return fallback;
+  }
+}
+
+function transcriptItemsForSummary(finalSession, chunks) {
+  return [...finalSession.transcripts]
+    .sort((a, b) => a.start_ms - b.start_ms)
+    .map((item) => ({
+      start_ms: item.start_ms,
+      end_ms: item.end_ms,
+      chunks: chunksOverlapping(chunks, item.start_ms, item.end_ms),
+      text: item.text,
+    }));
+}
+
+function chunksOverlapping(chunks, startMs, endMs) {
+  const overlap = chunks.filter((chunk) => {
+    const chunkStart = Number(chunk.start_ms) || 0;
+    const chunkEnd = Number(chunk.end_ms) || chunkStart;
+    return chunkEnd >= startMs && chunkStart <= endMs;
+  });
+  return overlap.length > 0 ? overlap : chunks;
+}
+
+function voiceSummaryPrompt(finalSession, chunks) {
+  const items = transcriptItemsForSummary(finalSession, chunks);
+  const started = formatJstDateTime(finalSession.startedAt);
+  const ended = formatJstDateTime(finalSession.endedAt || new Date(finalSession.startedAt.getTime() + Math.max(0, ...items.map((item) => item.end_ms))));
+  const lines = [
+    "以下の形式に厳密に合わせて、VC文字起こし時系列まとめを作成してください。",
+    "",
+    "VC文字起こし時系列まとめ（JST目安）",
+    `対象VC: <#${VOICE_CHANNEL_ID}>`,
+    `録音: ${started} - ${ended} JST`,
+    "",
+    "話者分離なしのWhisper transcriptを、録音chunk量から主話者推定して整理しています。",
+    "",
+    "1. M/D HH:MM-HH:MM",
+    "主な話者: 話者A / 話者B",
+    "この時間帯で何を話していたかを2-3文で自然に要約。",
+    "",
+    "注意:",
+    "- 各セグメントを1項目として出力してください。",
+    "- transcriptの誤字は文脈で補正してください。",
+    "- 生の断片や反復をそのまま貼らないでください。",
+    "- 事実として読めない内容は断定しないでください。",
+    "",
+    "Transcript segments:",
+  ];
+  for (const [index, item] of items.entries()) {
+    const speakers = topSpeakerNames(item.chunks, 3).join(" / ") || "不明";
+    lines.push("");
+    lines.push(`SEGMENT ${index + 1}`);
+    lines.push(`time: ${formatJstOffsetRange(finalSession.startedAt, item.start_ms, item.end_ms)}`);
+    lines.push(`main_speakers: ${speakers}`);
+    lines.push("text:");
+    lines.push(cleanWhisperTextForSummary(item.text).slice(0, LLM_SUMMARY_MAX_CHARS_PER_SEGMENT));
+  }
+  return lines.join("\n");
+}
+
+function cleanWhisperTextForSummary(text) {
+  return String(text || "")
+    .replace(/\b(?:yeah|oh yeah|I was|I don't know|hush|hud)(?:[,\s.。!?、]+(?:yeah|oh yeah|I was|I don't know|hush|hud))*\b/gi, " ")
+    .replace(/([ぁ-んァ-ン一-龠A-Za-z0-9]{1,12})(?:\s*\1){4,}/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function requestChatCompletion(messages) {
+  if (["hermes", "hermes-codex", "openai-codex", "codex"].includes(LLM_SUMMARY_PROVIDER)) {
+    return requestHermesSummary(messages);
+  }
+  if (!LLM_SUMMARY_API_KEY) {
+    throw new Error("LLM summary API key is missing");
+  }
+  const response = await fetch(`${LLM_SUMMARY_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${LLM_SUMMARY_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: LLM_SUMMARY_MODEL,
+      messages,
+      temperature: 0.2,
+    }),
+  });
+  const body = await response.text();
+  if (!response.ok) throw new Error(`LLM summary HTTP ${response.status}: ${body.slice(0, 1000)}`);
+  const parsed = parseJsonObject(body) || JSON.parse(body);
+  return parsed?.choices?.[0]?.message?.content || "";
+}
+
+async function requestHermesSummary(messages) {
+  const prompt = messages
+    .map((message) => `# ${message.role}\n${message.content}`)
+    .join("\n\n");
+  const env = {
+    ...process.env,
+    HOME: process.env.HOME || "/Users/nikenike",
+    HERMES_HOME: PROFILE_DIR,
+    HERMES_ACCEPT_HOOKS: "1",
+  };
+  const { stdout } = await runCommandCapture(HERMES_BIN, [
+    "-z",
+    prompt,
+    "--provider",
+    HERMES_SUMMARY_PROVIDER,
+    "-m",
+    HERMES_SUMMARY_MODEL,
+    "--ignore-rules",
+  ], { env });
+  return stdout.trim();
+}
+
+function splitChunksByDuration(chunks, maxDurationMs) {
+  const limitMs = Math.max(60 * 1000, maxDurationMs);
+  const groups = [];
+  let current = [];
+  let currentStartMs = null;
+  for (const chunk of chunks) {
+    const chunkStartMs = Number(chunk.start_ms) || 0;
+    const chunkEndMs = Number(chunk.end_ms) || chunkStartMs;
+    if (current.length === 0) {
+      current = [chunk];
+      currentStartMs = chunkStartMs;
+      continue;
+    }
+    if (chunkEndMs - currentStartMs > limitMs) {
+      groups.push(current);
+      current = [chunk];
+      currentStartMs = chunkStartMs;
+    } else {
+      current.push(chunk);
+    }
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
 }
 
 async function resolveLocalWhisperCommand() {
@@ -767,17 +1144,27 @@ async function postSummary(finalSession, summary, transcriptPath) {
     log("summary channel is not text based", { channel_id: SUMMARY_CHANNEL_ID });
     return;
   }
-  const header = [
-    `VC文字起こし要約`,
-    `対象VC: <#${VOICE_CHANNEL_ID}>`,
-    `開始: ${finalSession.startedAt.toISOString()}`,
-    `終了: ${finalSession.endedAt.toISOString()}`,
-  ].join("\n");
-  const content = `${header}\n\n${summary}`.slice(0, 1900);
+  const chunks = splitDiscordText(summary, 1900);
   const attachment = fs.existsSync(transcriptPath)
     ? new AttachmentBuilder(transcriptPath, { name: `voice-transcript-${finalSession.id}.md` })
     : undefined;
-  await channel.send({ content, files: attachment ? [attachment] : [] });
+  for (const [index, content] of chunks.entries()) {
+    await channel.send({ content, files: index === 0 && attachment ? [attachment] : [] });
+  }
+}
+
+function splitDiscordText(text, limit) {
+  const chunks = [];
+  let rest = String(text || "").trim();
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf("\n\n", limit);
+    if (cut < limit * 0.5) cut = rest.lastIndexOf("\n", limit);
+    if (cut < limit * 0.5) cut = limit;
+    chunks.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) chunks.push(rest);
+  return chunks.length > 0 ? chunks : ["文字起こし結果が空でした。"];
 }
 
 function formatTranscriptLine(item) {
@@ -847,7 +1234,13 @@ async function main() {
       max_session_chunks: MAX_SESSION_CHUNKS,
       max_session_audio_bytes: MAX_SESSION_AUDIO_BYTES,
       local_max_session_seconds: LOCAL_MAX_SESSION_SECONDS,
+      local_max_total_session_seconds: LOCAL_MAX_TOTAL_SESSION_SECONDS,
+      local_segment_seconds: LOCAL_SEGMENT_SECONDS,
       local_max_session_chunks: LOCAL_MAX_SESSION_CHUNKS,
+      llm_summary_enabled: LLM_SUMMARY_ENABLED,
+      llm_summary_provider: LLM_SUMMARY_PROVIDER,
+      hermes_summary_provider: HERMES_SUMMARY_PROVIDER,
+      hermes_summary_model: HERMES_SUMMARY_MODEL,
     });
     await evaluateVoiceState("ready");
   });
@@ -860,6 +1253,67 @@ async function main() {
   await client.login(TOKEN);
 }
 
+async function reprocessSession(sessionPath) {
+  if (!sessionPath) throw new Error("usage: discord-voice-transcriber.mjs --reprocess-session <session-dir-or-id>");
+  const cwdSessionDir = path.resolve(process.cwd(), sessionPath);
+  const sessionDir = path.isAbsolute(sessionPath)
+    ? sessionPath
+    : fs.existsSync(path.join(cwdSessionDir, "session.json"))
+      ? cwdSessionDir
+      : path.join(SESSION_DIR, sessionPath);
+  const sessionJsonPath = path.join(sessionDir, "session.json");
+  const chunksJsonlPath = path.join(sessionDir, "chunks.jsonl");
+  if (!fs.existsSync(sessionJsonPath)) throw new Error(`session.json is missing: ${sessionJsonPath}`);
+  if (!fs.existsSync(chunksJsonlPath)) throw new Error(`chunks.jsonl is missing: ${chunksJsonlPath}`);
+  const sessionJson = JSON.parse(fs.readFileSync(sessionJsonPath, "utf8"));
+  const chunks = readJsonl(chunksJsonlPath);
+  const finalSession = {
+    id: sessionJson.id || path.basename(sessionDir),
+    dir: sessionDir,
+    startedAt: new Date(sessionJson.started_at || fs.statSync(sessionDir).birthtime),
+    endedAt: new Date(sessionJson.ended_at || Date.now()),
+    chunks,
+    transcripts: [],
+    summaryMarkdown: "",
+    sessionAudioPath: null,
+  };
+  tryUnlink(path.join(sessionDir, "transcripts.jsonl"));
+  await transcribeSessionOnce(finalSession);
+  writeJsonFor(finalSession, "session.json", {
+    id: finalSession.id,
+    guild_id: sessionJson.guild_id || GUILD_ID,
+    voice_channel_id: sessionJson.voice_channel_id || VOICE_CHANNEL_ID,
+    started_at: finalSession.startedAt.toISOString(),
+    ended_at: finalSession.endedAt.toISOString(),
+    chunk_count: finalSession.chunks.length,
+    transcript_count: finalSession.transcripts.length,
+    transcription_status: finalSession.transcriptionStatus || null,
+    session_audio_path: finalSession.sessionAudioPath || null,
+  });
+  writeTranscriptAndSummary(finalSession);
+  log("recording session reprocessed", {
+    session_id: finalSession.id,
+    transcript_count: finalSession.transcripts.length,
+    status: finalSession.transcriptionStatus?.status,
+  });
+}
+
+function readJsonl(filePath) {
+  return fs.readFileSync(filePath, "utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function run() {
+  if (process.argv[2] === "--reprocess-session") {
+    await reprocessSession(process.argv[3]);
+    return;
+  }
+  await main();
+}
+
 process.on("SIGTERM", async () => {
   log("received SIGTERM");
   if (session) await stopSession();
@@ -867,7 +1321,7 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-main().catch((error) => {
+run().catch((error) => {
   console.error(`${new Date().toISOString()} fatal ${error.stack || error}`);
   process.exit(1);
 });
