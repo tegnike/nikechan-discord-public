@@ -153,10 +153,10 @@ def sanitize_error(detail: str) -> str:
     text = detail.strip()
     if "Missing Access" in text or '"code": 50001' in text:
         return "権限なしのため取得スキップ"
-    if "network timeout" in text or "timed out" in text or "TimeoutError" in text:
-        return "Discord API取得タイムアウト"
+    if "network timeout" in text or "timed out" in text or "TimeoutError" in text or "TimeoutExpired" in text:
+        return "Discord APIの応答待ちがタイムアウトしました"
     if "429" in text or "retry limit" in text:
-        return "Discord API rate limit"
+        return "Discord APIのrate limitに当たりました"
     if "DISCORD_BOT_TOKEN" in text:
         return "Discord Bot token未設定"
     if "Discord API" in text:
@@ -312,8 +312,14 @@ def charge_for(reason: str | None, sample: str = "") -> str:
     return "サーバー迷惑行為罪"
 
 
-def collect_messages(guild: str, since: str, limit: int) -> tuple[list[dict], list[str], int]:
-    channels_data = run_json([HISTORY, "list-channels", "--guild", guild])
+def collect_messages(guild: str, since: str, limit: int) -> tuple[list[dict], list[str], int, str | None]:
+    try:
+        channels_data = run_json([HISTORY, "list-channels", "--guild", guild])
+    except Exception as e:
+        detail = f"list-channels failed: {e}"
+        append_error({"id": guild, "name": "guild channel list"}, detail)
+        return [], [f"チャンネル一覧取得: {sanitize_error(detail)}"], 0, "guild_channels"
+
     messages: list[dict] = []
     errors: list[str] = []
     skipped_inaccessible = 0
@@ -340,7 +346,7 @@ def collect_messages(guild: str, since: str, limit: int) -> tuple[list[dict], li
             msg["_channel_name"] = channel.get("name")
             messages.append(msg)
         time.sleep(0.15)
-    return messages, errors, skipped_inaccessible
+    return messages, errors, skipped_inaccessible, None
 
 
 def compact_message_for_review(message: dict) -> dict:
@@ -579,7 +585,17 @@ def format_report(report: dict) -> str:
                 lines.append(f"解除時間: 実行失敗")
                 lines.append(f"エラー: {action.get('error')}")
     if errors:
-        lines.append(f"補足: 一部チャンネルで取得エラーがありました（{len(errors)}件）。詳細は管理側ログに記録済みです。")
+        if not actions:
+            lines.append("Discord自律モデレーションの履歴取得でエラーがありました。")
+            if report.get("error_scope") == "guild_channels":
+                lines.append("チャンネル一覧を取得できなかったため、今回のチェックはスキップしました。timeout処理は実行していません。")
+            else:
+                lines.append("一部チャンネルを取得できなかったため、取得できた範囲だけ確認しました。timeout処理は実行していません。")
+            lines.append("原因候補: Discord APIの一時的な遅延、rate limit、またはネットワーク不調。")
+            lines.append("エラー: " + " / ".join(errors[:3]))
+            lines.append("詳細はサブMacの local/discord-autofreeze/errors.jsonl に記録済みです。")
+        else:
+            lines.append(f"補足: 一部チャンネルで取得エラーがありました（{len(errors)}件）。詳細は管理側ログに記録済みです。")
     return "\n".join(lines)
 
 
@@ -599,7 +615,7 @@ def main():
 
     now = dt.datetime.now(dt.timezone.utc)
     since = iso_utc(now - dt.timedelta(minutes=args.window_minutes))
-    messages, errors, skipped_inaccessible = collect_messages(args.guild, since, args.limit_per_channel)
+    messages, errors, skipped_inaccessible, error_scope = collect_messages(args.guild, since, args.limit_per_channel)
     decisions = decide(messages, now)
     actions = []
     for decision in decisions:
@@ -618,6 +634,7 @@ def main():
         "skipped_inaccessible_channels": skipped_inaccessible,
         "actions": actions,
         "errors": errors[:10],
+        "error_scope": error_scope,
     }
     if actions:
         print(format_report(report))
@@ -625,6 +642,8 @@ def main():
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         with ERRORS.open("a", encoding="utf-8") as f:
             f.write(json.dumps({**report, "created_at": iso_utc(now)}, ensure_ascii=False) + "\n")
+        if error_scope == "guild_channels":
+            print(format_report(report))
     elif not args.quiet:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     return 1 if any(a.get("status") == "error" for a in actions) else 0
